@@ -14,26 +14,32 @@ import { RegisterPage } from '@/pages/Register'
 import { PrivacyPage } from '@/pages/Privacy'
 import { TermsPage } from '@/pages/Terms'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
+import { RequireAuth } from '@/components/RequireAuth'
 import { CookieConsent } from '@/components/CookieConsent'
 
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
+        {/* Public routes */}
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
-        <Route element={<Layout />}>
-          <Route index element={<Dashboard />} />
-          <Route path="sets" element={<SetsPage />} />
-          <Route path="cards" element={<Cards />} />
-          <Route path="analytics" element={<ProtectedRoute requiredRole="premium"><AnalyticsPage /></ProtectedRoute>} />
-          <Route path="watchlist" element={<WatchlistPage />} />
-          <Route path="signals" element={<BuySignals />} />
-          <Route path="alerts" element={<AlertsPage />} />
-          <Route path="track-record" element={<TrackRecordPage />} />
-          <Route path="card-show" element={<CardShowPage />} />
-          <Route path="privacy" element={<PrivacyPage />} />
-          <Route path="terms" element={<TermsPage />} />
+        <Route path="/privacy" element={<PrivacyPage />} />
+        <Route path="/terms" element={<TermsPage />} />
+
+        {/* Authenticated routes */}
+        <Route element={<RequireAuth />}>
+          <Route element={<Layout />}>
+            <Route index element={<Dashboard />} />
+            <Route path="sets" element={<SetsPage />} />
+            <Route path="cards" element={<Cards />} />
+            <Route path="analytics" element={<ProtectedRoute requiredRole="premium"><AnalyticsPage /></ProtectedRoute>} />
+            <Route path="watchlist" element={<ProtectedRoute requiredRole="premium"><WatchlistPage /></ProtectedRoute>} />
+            <Route path="signals" element={<ProtectedRoute requiredRole="premium"><BuySignals /></ProtectedRoute>} />
+            <Route path="alerts" element={<ProtectedRoute requiredRole="premium"><AlertsPage /></ProtectedRoute>} />
+            <Route path="track-record" element={<ProtectedRoute requiredRole="premium"><TrackRecordPage /></ProtectedRoute>} />
+            <Route path="card-show" element={<ProtectedRoute requiredRole="premium"><CardShowPage /></ProtectedRoute>} />
+          </Route>
         </Route>
       </Routes>
       <CookieConsent />

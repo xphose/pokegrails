@@ -32,6 +32,8 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    env_file:
+      - .env.production
     depends_on:
       app:
         condition: service_healthy

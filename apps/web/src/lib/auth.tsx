@@ -18,6 +18,7 @@ interface AuthState {
 interface AuthContextType extends AuthState {
   login: (login: string, password: string) => Promise<void>
   register: (username: string, email: string, password: string) => Promise<void>
+  loginWithGoogle: (credential: string) => Promise<void>
   logout: () => void
   isAdmin: boolean
   isPremium: boolean
@@ -121,6 +122,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setState({ user: data.user, loading: false })
   }
 
+  const loginWithGoogle = async (credential: string) => {
+    const data = await authApi<{ user: User; accessToken: string; refreshToken: string }>(
+      '/api/auth/google',
+      { method: 'POST', body: JSON.stringify({ credential }) },
+    )
+    setTokens(data.accessToken, data.refreshToken)
+    setState({ user: data.user, loading: false })
+  }
+
   const logout = () => {
     const token = getAccessToken()
     if (token) {
@@ -139,6 +149,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         ...state,
         login,
         register,
+        loginWithGoogle,
         logout,
         isAdmin: state.user?.role === 'admin',
         isPremium: state.user?.role === 'premium' || state.user?.role === 'admin',

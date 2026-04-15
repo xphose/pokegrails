@@ -74,6 +74,8 @@ export function runMigrations(db: Database.Database) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash)`)
 
   safeAdd('users', 'display_name', 'TEXT')
+  safeAdd('users', 'oauth_provider', 'TEXT')
+  safeAdd('users', 'oauth_id', 'TEXT')
 
   db.exec(`CREATE TABLE IF NOT EXISTS prediction_snapshots (
     card_id TEXT NOT NULL,

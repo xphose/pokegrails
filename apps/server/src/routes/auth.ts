@@ -173,6 +173,81 @@ export function authRoutes(db: Database): Router {
     }
   })
 
+  router.post('/google', async (req: Request, res: Response) => {
+    try {
+      const { credential } = req.body as { credential?: string }
+      if (!credential) {
+        res.status(400).json({ error: 'credential is required' })
+        return
+      }
+      if (!config.googleClientId) {
+        res.status(503).json({ error: 'Google login is not configured' })
+        return
+      }
+
+      const verifyRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`)
+      if (!verifyRes.ok) {
+        res.status(401).json({ error: 'Invalid Google credential' })
+        return
+      }
+      const gInfo = await verifyRes.json() as { sub?: string; email?: string; name?: string; aud?: string }
+      if (gInfo.aud !== config.googleClientId) {
+        res.status(401).json({ error: 'Token audience mismatch' })
+        return
+      }
+      if (!gInfo.email || !gInfo.sub) {
+        res.status(401).json({ error: 'Invalid token payload' })
+        return
+      }
+
+      const email = gInfo.email.toLowerCase()
+      const googleId = gInfo.sub
+      const displayName = gInfo.name || email.split('@')[0]
+
+      let user = db.prepare('SELECT id, username, email, role FROM users WHERE email = ?').get(email) as
+        | { id: number; username: string; email: string; role: string } | undefined
+
+      if (!user) {
+        const username = email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 30) || `user_${googleId.slice(-6)}`
+        let finalUsername = username
+        let suffix = 1
+        while (db.prepare('SELECT 1 FROM users WHERE username = ?').get(finalUsername.toLowerCase())) {
+          finalUsername = `${username.slice(0, 26)}_${suffix++}`
+        }
+
+        const isFirstUser = !(db.prepare('SELECT 1 FROM users LIMIT 1').get())
+        const role = isFirstUser ? 'admin' : 'free'
+        const dummyHash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), SALT_ROUNDS)
+
+        const result = db.prepare(
+          'INSERT INTO users (username, email, password_hash, role, display_name, oauth_provider, oauth_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(finalUsername, email, dummyHash, role, displayName, 'google', googleId)
+
+        user = { id: Number(result.lastInsertRowid), username: finalUsername, email, role }
+      } else {
+        db.prepare('UPDATE users SET oauth_provider = ?, oauth_id = ?, last_login = datetime(\'now\') WHERE id = ?')
+          .run('google', googleId, user.id)
+      }
+
+      const payload: JwtPayload = { userId: user.id, username: user.username, role: user.role as any }
+      const { accessToken, refreshToken } = generateTokens(payload)
+
+      const tokenHash = hashRefreshToken(refreshToken)
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+      db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').run(user.id)
+      db.prepare('INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)').run(user.id, tokenHash, expiresAt)
+
+      res.json({
+        user: { id: user.id, username: user.username, email: user.email, role: user.role },
+        accessToken,
+        refreshToken,
+      })
+    } catch (e) {
+      console.error('[auth] Google login error:', e)
+      res.status(500).json({ error: 'Google login failed' })
+    }
+  })
+
   router.get('/me', authenticate, (req: Request, res: Response) => {
     const user = db.prepare('SELECT id, username, email, role, display_name, created_at, last_login FROM users WHERE id = ?').get(req.user!.userId)
     if (!user) {

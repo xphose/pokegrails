@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, beforeEach, vi } from 'vitest'
 import request from 'supertest'
 import { createApp } from './app.js'
-import { openMemoryDb, seedMinimalCard, adminToken, premiumToken } from './test/helpers.js'
+import { openMemoryDb, seedMinimalCard, adminToken, premiumToken, freeToken } from './test/helpers.js'
 
 describe('createApp', () => {
   let db: ReturnType<typeof openMemoryDb>
@@ -471,5 +471,32 @@ describe('30d sparkline / trend', () => {
     for (let i = 1; i < spark.length; i++) {
       expect(spark[i].p).toBeGreaterThan(spark[i - 1].p)
     }
+  })
+})
+
+describe('POST /api/auth/google', () => {
+  it('returns 400 when credential is missing', async () => {
+    const db = openMemoryDb()
+    const app = createApp(db)
+    await request(app).post('/api/auth/google').send({}).expect(400)
+  })
+
+  it('returns 503 when GOOGLE_CLIENT_ID is not configured', async () => {
+    const db = openMemoryDb()
+    const app = createApp(db)
+    const res = await request(app).post('/api/auth/google').send({ credential: 'fake-token' }).expect(503)
+    expect(res.body.error).toContain('not configured')
+  })
+})
+
+describe('Premium route gating', () => {
+  it('GET /api/cards/:id/investment returns 403 for free users', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    const app = createApp(db)
+    await request(app)
+      .get('/api/cards/test-card-1/investment')
+      .set('Authorization', `Bearer ${freeToken()}`)
+      .expect(403)
   })
 })

@@ -33,6 +33,7 @@ export const config = {
   jwtRefreshExpiresIn: '7d',
   nodeEnv: process.env.NODE_ENV || 'development',
   pokemonTcgBase: 'https://api.pokemontcg.io/v2',
+  googleClientId: process.env.GOOGLE_CLIENT_ID || '',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
   stripePriceIdMonthly: process.env.STRIPE_PRICE_ID_MONTHLY || '',

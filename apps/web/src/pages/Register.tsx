@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/lib/auth'
+import { GoogleSignInButton } from '@/components/GoogleSignInButton'
 
 export function RegisterPage() {
   const { register } = useAuth()
@@ -41,6 +42,20 @@ export function RegisterPage() {
         <div className="mb-6 text-center">
           <h1 className="text-2xl font-bold tracking-tight text-primary">PokeGrails</h1>
           <p className="mt-1 text-sm text-muted-foreground">Create your account</p>
+        </div>
+
+        <GoogleSignInButton
+          onSuccess={() => navigate('/', { replace: true })}
+          onError={(msg) => setError(msg)}
+        />
+
+        <div className="relative my-5">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-border" />
+          </div>
+          <div className="relative flex justify-center text-xs">
+            <span className="bg-card px-3 text-muted-foreground">or create account with email</span>
+          </div>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -133,6 +148,13 @@ export function RegisterPage() {
             Sign in
           </Link>
         </p>
+
+        <div className="mt-4 rounded-lg border border-border bg-muted/30 px-4 py-3 text-center">
+          <p className="text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">Free accounts</span> get access to the 3 newest sets.{' '}
+            Subscribe to <span className="font-medium text-amber-400">Premium</span> for full catalog access and analytics.
+          </p>
+        </div>
       </div>
     </div>
   )

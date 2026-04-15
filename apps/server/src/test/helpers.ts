@@ -18,6 +18,10 @@ export function premiumToken(): string {
   return jwt.sign({ userId: 2, username: 'testpremium', role: 'premium' }, config.jwtSecret, { expiresIn: '1h' })
 }
 
+export function freeToken(): string {
+  return jwt.sign({ userId: 3, username: 'testfree', role: 'free' }, config.jwtSecret, { expiresIn: '1h' })
+}
+
 export function seedMinimalCard(db: Database.Database) {
   db.prepare(
     `INSERT INTO sets (id, name, release_date, total_cards, last_updated) VALUES (?, ?, ?, ?, datetime('now'))`,
