@@ -252,7 +252,7 @@ export function createApp(db: Database) {
       `SELECT c.id, c.name, c.set_id, s.name AS set_name
        FROM cards c LEFT JOIN sets s ON c.set_id = s.id
        WHERE c.id = ?`,
-    ).get(req.params.id) as
+    ).get(String(req.params.id)) as
       | { id: string; name: string; set_id: string | null; set_name: string | null }
       | undefined
     if (!row) return res.status(404).json({ error: 'Not found' })
@@ -266,7 +266,7 @@ export function createApp(db: Database) {
   })
 
   app.get('/api/cards/:id', optionalAuth, (req, res) => {
-    const row = db.prepare(`SELECT * FROM cards WHERE id = ?`).get(req.params.id) as { set_id?: string | null } | undefined
+    const row = db.prepare(`SELECT * FROM cards WHERE id = ?`).get(String(req.params.id)) as { set_id?: string | null } | undefined
     if (!row) return res.status(404).json({ error: 'Not found' })
     if (isFreeUser(req) && row.set_id) {
       const allowed = getFreeSetIds(db)
@@ -282,7 +282,7 @@ export function createApp(db: Database) {
            AND (pricecharting_median IS NOT NULL OR tcgplayer_market IS NOT NULL)
          ORDER BY timestamp DESC`,
       )
-      .all(req.params.id)
+      .all(String(req.params.id))
     res.json({ card: row, priceHistory: hist })
   })
 
@@ -294,7 +294,7 @@ export function createApp(db: Database) {
          LEFT JOIN character_premiums cp ON cp.character_name = c.character_name
          WHERE c.id = ?`,
       )
-      .get(req.params.id) as
+      .get(String(req.params.id)) as
       | {
           id: string
           name: string
@@ -477,8 +477,8 @@ export function createApp(db: Database) {
 
   app.get('/api/upcoming/:id/predict', (req, res) => {
     try {
-      predictChaseForUpcoming(db, req.params.id)
-      const row = db.prepare(`SELECT * FROM upcoming_sets WHERE id = ?`).get(req.params.id)
+      predictChaseForUpcoming(db, String(req.params.id))
+      const row = db.prepare(`SELECT * FROM upcoming_sets WHERE id = ?`).get(String(req.params.id))
       res.json(row)
     } catch (e) {
       res.status(500).json({ error: String(e) })
@@ -520,7 +520,7 @@ export function createApp(db: Database) {
   })
 
   app.delete('/api/watchlist/:id', (req, res) => {
-    db.prepare(`DELETE FROM watchlist WHERE id = ?`).run(req.params.id)
+    db.prepare(`DELETE FROM watchlist WHERE id = ?`).run(String(req.params.id))
     res.json({ ok: true })
   })
 
@@ -595,7 +595,7 @@ export function createApp(db: Database) {
   app.patch('/api/cards/:id/artwork-score', (req, res) => {
     const v = Number((req.body as { score?: number }).score)
     if (Number.isNaN(v)) return res.status(400).json({ error: 'score required' })
-    db.prepare(`UPDATE cards SET artwork_hype_score = ? WHERE id = ?`).run(Math.min(10, Math.max(1, v)), req.params.id)
+    db.prepare(`UPDATE cards SET artwork_hype_score = ? WHERE id = ?`).run(Math.min(10, Math.max(1, v)), String(req.params.id))
     res.json({ ok: true })
   })
 
@@ -607,7 +607,7 @@ export function createApp(db: Database) {
         `SELECT set_id, product_type, source, price, packs, fetched_at
          FROM sealed_products WHERE set_id = ? ORDER BY fetched_at DESC`,
       )
-      .all(req.params.setId)
+      .all(String(req.params.setId))
     res.json(rows)
   })
 
@@ -664,7 +664,7 @@ export function createApp(db: Database) {
 
   app.get('/api/models/timeseries/:cardId', ...premiumAuth, (req, res) => {
     const horizon = Math.min(180, Math.max(7, parseInt(String(req.query.horizon ?? '30'), 10) || 30))
-    const result = forecastTimeSeries(db, req.params.cardId, horizon)
+    const result = forecastTimeSeries(db, String(req.params.cardId), horizon)
     res.json(result)
   })
 
@@ -678,7 +678,7 @@ export function createApp(db: Database) {
   })
 
   app.get('/api/models/gradient-boost/predict/:cardId', ...premiumAuth, (req, res) => {
-    res.json(predictGradientBoost(db, req.params.cardId))
+    res.json(predictGradientBoost(db, String(req.params.cardId)))
   })
 
   app.get('/api/models/random-forest/feature-importance', ...premiumAuth, cachedJson(300_000, () => computeFeatureImportance(db)))
@@ -691,14 +691,14 @@ export function createApp(db: Database) {
   }))
 
   app.get('/api/models/momentum/:cardId', ...premiumAuth, (req, res) => {
-    res.json(getCardMomentum(db, req.params.cardId))
+    res.json(getCardMomentum(db, String(req.params.cardId)))
   })
 
   app.get('/api/models/sentiment/top-positive', ...premiumAuth, cachedJson(120_000, () => getTopSentiment(db, 'positive')))
   app.get('/api/models/sentiment/top-negative', ...premiumAuth, cachedJson(120_000, () => getTopSentiment(db, 'negative')))
 
   app.get('/api/models/sentiment/:cardId', ...premiumAuth, (req, res) => {
-    res.json(analyzeCardSentiment(db, req.params.cardId))
+    res.json(analyzeCardSentiment(db, String(req.params.cardId)))
   })
 
   app.get('/api/models/supply-shock/alerts', ...premiumAuth, cachedJson(300_000, (req) => {
@@ -716,7 +716,7 @@ export function createApp(db: Database) {
   }))
 
   app.get('/api/models/anomalies/:cardId', ...premiumAuth, (req, res) => {
-    res.json(detectAnomalies(db, { cardId: req.params.cardId }))
+    res.json(detectAnomalies(db, { cardId: String(req.params.cardId) }))
   })
 
   app.get('/api/models/cointegration/pairs', ...premiumAuth, cachedJson(300_000, (req) => {
@@ -727,17 +727,17 @@ export function createApp(db: Database) {
   }))
 
   app.get('/api/models/cointegration/:cardId', ...premiumAuth, (req, res) => {
-    res.json(findCointegrationPairs(db, { cardId: req.params.cardId, limit: 10 }))
+    res.json(findCointegrationPairs(db, { cardId: String(req.params.cardId), limit: 10 }))
   })
 
   app.get('/api/models/bayesian/estimate/:cardId', ...premiumAuth, (req, res) => {
-    res.json(bayesianEstimate(db, req.params.cardId))
+    res.json(bayesianEstimate(db, String(req.params.cardId)))
   })
 
   app.get('/api/models/clusters/all', ...premiumAuth, cachedJson(300_000, () => runClustering(db)))
 
   app.get('/api/models/clusters/:cardId', ...premiumAuth, (req, res) => {
-    res.json(getCardCluster(db, req.params.cardId))
+    res.json(getCardCluster(db, String(req.params.cardId)))
   })
 
   app.get('/api/models/pca/components', ...premiumAuth, cachedJson(300_000, () => computePCA(db)))
@@ -804,7 +804,7 @@ export function createApp(db: Database) {
   }
 
   app.post('/api/models/run/:modelId', authenticate, requireAdmin, (req, res) => {
-    const { modelId } = req.params
+    const modelId = String(req.params.modelId)
     const runner = MODEL_RUNNERS[modelId]
     if (!runner) return res.status(404).json({ ok: false, error: `Unknown model: ${modelId}` })
 
