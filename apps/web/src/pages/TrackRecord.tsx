@@ -538,10 +538,10 @@ function ChartsTab({ data }: { data: TrackRecordData }) {
                     <YAxis tickFormatter={formatPctAxis} width={38} tick={{ fontSize: 10 }} className="text-muted-foreground" />
                     <Tooltip
                       contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8, fontSize: 12 }}
-                      labelFormatter={(d: string) => new Date(d).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
-                      formatter={(v: number, _n: string, entry: { payload?: AccuracyPoint }) => {
+                      labelFormatter={(d: unknown) => new Date(String(d)).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
+                      formatter={(v: unknown, _n: unknown, entry: { payload?: AccuracyPoint }) => {
                         const pt = entry?.payload
-                        return [`${v.toFixed(1)}% error${pt ? ` · ${pt.signal_count} signals active` : ''}`, 'Median Error']
+                        return [`${Number(v).toFixed(1)}% error${pt ? ` · ${pt.signal_count} signals active` : ''}`, 'Median Error']
                       }}
                     />
                     <Area type="monotone" dataKey="mean_error_pct" stroke="hsl(var(--chart-1))" fill="url(#gradError)" strokeWidth={2} />
@@ -580,8 +580,8 @@ function ChartsTab({ data }: { data: TrackRecordData }) {
                     <YAxis domain={[0, 1]} tickFormatter={(v: number) => `${Math.round(v * 100)}%`} width={38} tick={{ fontSize: 10 }} className="text-muted-foreground" />
                     <Tooltip
                       contentStyle={{ backgroundColor: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8, fontSize: 12 }}
-                      labelFormatter={(d: string) => new Date(d).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
-                      formatter={(v: number) => [`${(v * 100).toFixed(1)}%`, 'Cumulative Hit Rate']}
+                      labelFormatter={(d: unknown) => new Date(String(d)).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
+                      formatter={(v: unknown) => [`${(Number(v) * 100).toFixed(1)}%`, 'Cumulative Hit Rate']}
                     />
                     <Line type="monotone" dataKey="hit_rate" stroke="hsl(var(--chart-2))" strokeWidth={2} dot={{ r: 3, fill: 'hsl(var(--chart-2))' }} />
                   </LineChart>

@@ -672,6 +672,7 @@ export function Dashboard() {
       print: '',
       sort: 'market_price',
       order: 'desc',
+      flagFilter: '',
       ...partial,
     }
     return `/cards?${cardsFiltersToSearchParams(base).toString()}`

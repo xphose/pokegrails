@@ -5,7 +5,7 @@ import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import {
   BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Tooltip,
-  AreaChart, Area, LineChart, Line, ScatterChart, Scatter,
+  Line,
   CartesianGrid, Cell, PieChart, Pie, ComposedChart,
 } from 'recharts'
 
@@ -212,7 +212,7 @@ function ModelStatusPanel() {
   const [selectedCard, setSelectedCard] = useState<CardSearchResult | null>(null)
   const [onDemandResults, setOnDemandResults] = useState<OnDemandResult[]>([])
   const [onDemandRunning, setOnDemandRunning] = useState(false)
-  const searchDebounceRef = useRef<ReturnType<typeof setTimeout>>()
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   const [debouncedSearch, setDebouncedSearch] = useState('')
   useEffect(() => {
@@ -770,7 +770,7 @@ function MarketIntelligencePanel() {
             <YAxis type="category" dataKey="name" tick={{ fill: 'var(--color-foreground)', fontSize: 12 }} width={110} />
             <Tooltip
               contentStyle={{ background: 'var(--color-card)', border: '1px solid var(--color-border)', borderRadius: 8, fontSize: 12 }}
-              formatter={(value: number, _name: string, entry: { payload: { interpretation: string } }) => [`${value}%`, entry.payload.interpretation]}
+              formatter={(value: unknown, _name: unknown, entry: { payload?: { interpretation?: string } }) => [`${Number(value)}%`, entry?.payload?.interpretation ?? '']}
             />
             <Bar dataKey="importance" radius={[0, 4, 4, 0]}>
               {chartData.map((_, i) => (

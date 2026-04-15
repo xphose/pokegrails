@@ -18,7 +18,6 @@ import { Button, buttonVariants } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
-import { Badge } from '@/components/ui/badge'
 import { Label } from '@/components/ui/label'
 import { AlertTriangle, ChevronDown, Eye, EyeOff } from 'lucide-react'
 import {
@@ -1092,7 +1091,7 @@ export function Cards() {
                       domain={['auto', 'auto']}
                     />
                     <RTooltip
-                      formatter={(value: number) => [`$${value.toFixed(2)}`, 'Price']}
+                      formatter={(value: unknown) => [`$${Number(value).toFixed(2)}`, 'Price']}
                       labelFormatter={(v) => {
                         const n = typeof v === 'number' ? v : Number(v)
                         return Number.isFinite(n) ? new Date(n).toLocaleDateString() : ''
