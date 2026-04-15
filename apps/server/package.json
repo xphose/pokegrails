@@ -12,6 +12,7 @@
     "validate-model": "tsx src/scripts/validateModel.ts"
   },
   "dependencies": {
+    "@esbuild/linux-x64": "^0.27.7",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",

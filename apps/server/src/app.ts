@@ -1,7 +1,7 @@
 import cors from 'cors'
 import express from 'express'
 import type { Database } from 'better-sqlite3'
-import { cacheGet, cacheInvalidateAll, cacheSet } from './cache.js'
+import { cacheGet, cacheInvalidateAll, cacheSet, cachedJson } from './cache.js'
 import { buildCardShowHtml } from './services/cardShowExport.js'
 import { getEurPerUsd } from './services/fx.js'
 import { predictChaseForUpcoming } from './services/upcoming.js'
@@ -19,6 +19,21 @@ import {
 } from './services/investment.js'
 import { refreshSealedPrices, storePriceSnapshot } from './services/sealedPrices.js'
 import { computeTrackRecord, takePredictionSnapshot } from './services/trackRecord.js'
+import { forecastTimeSeries } from './services/analytics/timeseries.js'
+import { trainGradientBoostModel, predictGradientBoost } from './services/analytics/gradientBoost.js'
+import { computeFeatureImportance } from './services/analytics/featureImportance.js'
+import { detectMomentumCards, getCardMomentum } from './services/analytics/momentum.js'
+import { analyzeCardSentiment, getTopSentiment } from './services/analytics/sentiment.js'
+import { detectSupplyShocks } from './services/analytics/supplyShock.js'
+import { detectAnomalies } from './services/analytics/anomaly.js'
+import { findCointegrationPairs } from './services/analytics/cointegration.js'
+import { bayesianEstimate } from './services/analytics/bayesian.js'
+import { runClustering, getCardCluster } from './services/analytics/clustering.js'
+import { computePCA } from './services/analytics/pca.js'
+import {
+  getModelRunTime, getRunProgress, isRunning, startRun,
+  updateRunProgress, completeRunStep, finishRun,
+} from './services/analytics/shared.js'
 
 /**
  * Express app with all `/api` routes. Pass a database instance (file or :memory: for tests).
@@ -253,7 +268,7 @@ export function createApp(db: Database) {
     const sentiment = Math.max(0, Math.min(1, (momentum + Math.max(0, Math.min(1, (row.desirability_score ?? 5) / 10))) / 2))
     const lifecycle = row.set_id ? 0.55 : 0.45
     const catalyst = inferCatalystEvent(row)
-    const negotiation = buildNegotiation(fair, sentiment - 0.5)
+    const negotiation = buildNegotiation(fair, sentiment - 0.5, row.market_price)
     const comparable = buildComparableCards(db, row)
 
     res.json({
@@ -580,7 +595,211 @@ export function createApp(db: Database) {
     }
   })
 
+  /* ── Analytics model endpoints ─────────────────────────────── */
+
+  app.get('/api/models/timeseries/:cardId', (req, res) => {
+    const horizon = Math.min(180, Math.max(7, parseInt(String(req.query.horizon ?? '30'), 10) || 30))
+    const result = forecastTimeSeries(db, req.params.cardId, horizon)
+    res.json(result)
+  })
+
+  app.post('/api/models/gradient-boost/train', (_req, res) => {
+    try {
+      const model = trainGradientBoostModel(db)
+      res.json({ ok: true, trained_at: model.trainedAt, features: model.featureLabels.length })
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) })
+    }
+  })
+
+  app.get('/api/models/gradient-boost/predict/:cardId', (req, res) => {
+    res.json(predictGradientBoost(db, req.params.cardId))
+  })
+
+  app.get('/api/models/random-forest/feature-importance', cachedJson(300_000, () => computeFeatureImportance(db)))
+
+  app.get('/api/models/momentum/cards', cachedJson(120_000, (req) => {
+    const all = detectMomentumCards(db)
+    const limit = clampInt(req.query.limit, 1, 100, 15)
+    const offset = clampInt(req.query.offset, 0, all.length, 0)
+    return { items: all.slice(offset, offset + limit), total: all.length }
+  }))
+
+  app.get('/api/models/momentum/:cardId', (req, res) => {
+    res.json(getCardMomentum(db, req.params.cardId))
+  })
+
+  app.get('/api/models/sentiment/top-positive', cachedJson(120_000, () => getTopSentiment(db, 'positive')))
+  app.get('/api/models/sentiment/top-negative', cachedJson(120_000, () => getTopSentiment(db, 'negative')))
+
+  app.get('/api/models/sentiment/:cardId', (req, res) => {
+    res.json(analyzeCardSentiment(db, req.params.cardId))
+  })
+
+  app.get('/api/models/supply-shock/alerts', cachedJson(300_000, (req) => {
+    const all = detectSupplyShocks(db)
+    const limit = clampInt(req.query.limit, 1, 100, 30)
+    const offset = clampInt(req.query.offset, 0, all.length, 0)
+    return { items: all.slice(offset, offset + limit), total: all.length }
+  }))
+
+  app.get('/api/models/anomalies/recent', cachedJson(120_000, (req) => {
+    const all = detectAnomalies(db, { days: 30 })
+    const limit = clampInt(req.query.limit, 1, 100, 30)
+    const offset = clampInt(req.query.offset, 0, all.length, 0)
+    return { items: all.slice(offset, offset + limit), total: all.length }
+  }))
+
+  app.get('/api/models/anomalies/:cardId', (req, res) => {
+    res.json(detectAnomalies(db, { cardId: req.params.cardId }))
+  })
+
+  app.get('/api/models/cointegration/pairs', cachedJson(300_000, (req) => {
+    const all = findCointegrationPairs(db)
+    const limit = clampInt(req.query.limit, 1, 100, 20)
+    const offset = clampInt(req.query.offset, 0, all.length, 0)
+    return { items: all.slice(offset, offset + limit), total: all.length }
+  }))
+
+  app.get('/api/models/cointegration/:cardId', (req, res) => {
+    res.json(findCointegrationPairs(db, { cardId: req.params.cardId, limit: 10 }))
+  })
+
+  app.get('/api/models/bayesian/estimate/:cardId', (req, res) => {
+    res.json(bayesianEstimate(db, req.params.cardId))
+  })
+
+  app.get('/api/models/clusters/all', cachedJson(300_000, () => runClustering(db)))
+
+  app.get('/api/models/clusters/:cardId', (req, res) => {
+    res.json(getCardCluster(db, req.params.cardId))
+  })
+
+  app.get('/api/models/pca/components', cachedJson(300_000, () => computePCA(db)))
+
+  app.get('/api/models/status', (_req, res) => {
+    const cacheKey = 'GET:/api/models/status'
+    const hit = cacheGet(cacheKey)
+    const cached = hit ? JSON.parse(hit) as { total: number; withHistory: number; with30pts: number } : null
+
+    const total = cached?.total ?? (db.prepare(`SELECT COUNT(*) as c FROM cards WHERE market_price > 0`).get() as { c: number }).c
+    const withHistory = cached?.withHistory ?? (db.prepare(
+      `SELECT COUNT(DISTINCT ph.card_id) as c FROM price_history ph JOIN cards c ON c.id = ph.card_id WHERE c.market_price > 0`,
+    ).get() as { c: number }).c
+    const with30pts = cached?.with30pts ?? (db.prepare(
+      `SELECT COUNT(*) as c FROM (
+        SELECT ph.card_id FROM price_history ph
+        JOIN cards c ON c.id = ph.card_id
+        WHERE c.market_price > 0
+        GROUP BY ph.card_id HAVING COUNT(DISTINCT substr(ph.timestamp, 1, 10)) >= 30
+      )`,
+    ).get() as { c: number }).c
+
+    if (!cached) cacheSet(cacheKey, { total, withHistory, with30pts }, 60_000)
+
+    const models = [
+      { name: 'Time-Series Forecast', model_id: 'timeseries', min_data: 10, coverage: withHistory },
+      { name: 'Gradient Boost Predictor', model_id: 'gradient-boost', min_data: 10, coverage: total },
+      { name: 'Feature Importance (RF)', model_id: 'random-forest', min_data: 10, coverage: total },
+      { name: 'Momentum Detector', model_id: 'lstm-momentum', min_data: 10, coverage: withHistory },
+      { name: 'Sentiment Analysis', model_id: 'sentiment', min_data: 1, coverage: total },
+      { name: 'Supply Shock Detector', model_id: 'supply-shock', min_data: 10, coverage: withHistory },
+      { name: 'Anomaly Detector', model_id: 'anomaly', min_data: 10, coverage: withHistory },
+      { name: 'Cointegration Analyzer', model_id: 'cointegration', min_data: 20, coverage: with30pts },
+      { name: 'Bayesian Estimator', model_id: 'bayesian', min_data: 1, coverage: total },
+      { name: 'Card Clustering', model_id: 'clustering', min_data: 10, coverage: total },
+      { name: 'PCA Decomposer', model_id: 'pca', min_data: 10, coverage: total },
+    ]
+
+    res.json(models.map(m => ({
+      name: m.name,
+      model_id: m.model_id,
+      last_run: getModelRunTime(m.model_id),
+      card_coverage: m.coverage,
+      total_cards: total,
+      status: m.coverage >= m.min_data
+        ? (getModelRunTime(m.model_id) ? 'ready' : 'not_run')
+        : 'insufficient_data',
+    })))
+  })
+
+  app.get('/api/models/progress', (_req, res) => {
+    res.json(getRunProgress())
+  })
+
+  const MODEL_RUNNERS: Record<string, () => void> = {
+    'gradient-boost': () => trainGradientBoostModel(db),
+    'random-forest': () => computeFeatureImportance(db),
+    clustering: () => runClustering(db),
+    pca: () => computePCA(db),
+    'lstm-momentum': () => { detectMomentumCards(db) },
+    'supply-shock': () => { detectSupplyShocks(db) },
+    anomaly: () => { detectAnomalies(db, { days: 30 }) },
+    cointegration: () => { findCointegrationPairs(db) },
+  }
+
+  app.post('/api/models/run/:modelId', (req, res) => {
+    const { modelId } = req.params
+    const runner = MODEL_RUNNERS[modelId]
+    if (!runner) return res.status(404).json({ ok: false, error: `Unknown model: ${modelId}` })
+
+    if (!startRun(1, [modelId])) return res.status(409).json({ ok: false, error: 'Another run is in progress' })
+    updateRunProgress(modelId)
+
+    setImmediate(() => {
+      try {
+        runner()
+        completeRunStep(modelId)
+        cacheInvalidateAll()
+      } catch (e) {
+        finishRun(String(e))
+        return
+      }
+      finishRun()
+    })
+
+    res.json({ ok: true, model_id: modelId })
+  })
+
+  app.post('/api/models/run-all', (_req, res) => {
+    const modelIds = Object.keys(MODEL_RUNNERS)
+    if (!startRun(modelIds.length, modelIds)) {
+      return res.status(409).json({ ok: false, error: 'A run is already in progress' })
+    }
+
+    res.json({ ok: true, started_at: new Date().toISOString() })
+
+    let idx = 0
+
+    function runNext() {
+      if (idx >= modelIds.length) {
+        cacheInvalidateAll()
+        finishRun()
+        return
+      }
+      const modelId = modelIds[idx++]
+      updateRunProgress(modelId)
+      setImmediate(() => {
+        try {
+          MODEL_RUNNERS[modelId]()
+          completeRunStep(modelId)
+        } catch (e) {
+          finishRun(String(e))
+          return
+        }
+        runNext()
+      })
+    }
+
+    setImmediate(runNext)
+  })
+
   return app
+}
+
+function clampInt(raw: unknown, min: number, max: number, fallback: number): number {
+  const n = parseInt(String(raw ?? ''), 10)
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback
 }
 
 function getSparklineMap(db: Database, cardIds: string[]): Map<string, { p: number }[]> {
@@ -596,7 +815,9 @@ function getSparklineMap(db: Database, cardIds: string[]): Map<string, { p: numb
        ORDER BY card_id ASC, timestamp DESC`,
     )
     .all(...cardIds) as { card_id: string; timestamp: string; price: number | null }[]
+
   const latestByCard = new Map<string, number>()
+  const seenDays = new Map<string, Set<string>>()
   const windowMs = 31 * 86_400_000
   for (const r of rows) {
     if (r.price == null) continue
@@ -605,6 +826,13 @@ function getSparklineMap(db: Database, cardIds: string[]): Map<string, { p: numb
     const latest = latestByCard.get(r.card_id) ?? ts
     if (!latestByCard.has(r.card_id)) latestByCard.set(r.card_id, latest)
     if (ts < latest - windowMs) continue
+
+    const day = r.timestamp.slice(0, 10)
+    const days = seenDays.get(r.card_id) ?? new Set()
+    if (days.has(day)) continue
+    days.add(day)
+    seenDays.set(r.card_id, days)
+
     const arr = byCard.get(r.card_id) ?? []
     if (arr.length < 31) arr.push({ p: r.price })
     byCard.set(r.card_id, arr)

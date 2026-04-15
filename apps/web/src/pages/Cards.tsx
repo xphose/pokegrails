@@ -226,8 +226,8 @@ export function Cards() {
   const [flagFilter, setFlagFilter] = useState(() => getInitialCardsFilters(location.search).flagFilter)
   const [sort, setSort] = useState<SortKey>(() => coerceSort(getInitialCardsFilters(location.search).sort))
   const [order, setOrder] = useState<'asc' | 'desc'>(() => getInitialCardsFilters(location.search).order)
-  const [condition, setCondition] = useState<ConditionCode>('NM')
-  const [showAdjusted, setShowAdjusted] = useState(false)
+  const [condition, setCondition] = useState<ConditionCode>(() => loadStoredCondition())
+  const [showAdjusted, setShowAdjusted] = useState(() => loadShowAdjusted())
 
   const [columnVis, setColumnVis] = useState<Set<ColumnId>>(() => loadColumnVisibility())
   const [colMenuOpen, setColMenuOpen] = useState(false)
@@ -364,6 +364,13 @@ export function Cards() {
   const onConditionChange = (c: ConditionCode) => {
     setCondition(c)
     saveStoredCondition(c)
+    if (c !== 'NM' && !showAdjusted) {
+      setShowAdjusted(true)
+      saveShowAdjusted(true)
+    } else if (c === 'NM' && showAdjusted) {
+      setShowAdjusted(false)
+      saveShowAdjusted(false)
+    }
   }
 
   const onShowAdjustedChange = (v: boolean) => {
@@ -464,14 +471,14 @@ export function Cards() {
   const tableMinWidth = useMemo(() => {
     let w = 0
     if (show('name')) w += 14
-    if (show('ai')) w += 5.5
+    if (show('ai')) w += 6.5
     if (show('set_id')) w += 10
     if (show('card_type')) w += 6
     if (show('rarity')) w += 9
     if (show('pull')) w += 3.5
     if (show('desire')) w += 4
-    if (show('predicted')) { w += 6; if (showAdjusted) w += 6 }
-    if (show('market')) { w += 5.5; if (showAdjusted) w += 6 }
+    if (show('predicted')) { w += 6; if (showAdjusted) w += 7 }
+    if (show('market')) { w += 5.5; if (showAdjusted) w += 7 }
     if (show('gap')) w += 6.5
     if (show('ebay')) w += 5
     if (show('flag')) w += 10
@@ -718,16 +725,16 @@ export function Cards() {
             <Table className="table-fixed w-full">
               <colgroup>
                 {show('name') && <col style={{ width: '14rem' }} />}
-                {show('ai') && <col style={{ width: '5.5rem' }} />}
+                {show('ai') && <col style={{ width: '6.5rem' }} />}
                 {show('set_id') && <col style={{ width: '10rem' }} />}
                 {show('card_type') && <col style={{ width: '6rem' }} />}
                 {show('rarity') && <col style={{ width: '9rem' }} />}
                 {show('pull') && <col style={{ width: '3.5rem' }} />}
                 {show('desire') && <col style={{ width: '4rem' }} />}
                 {show('predicted') && <col style={{ width: '6rem' }} />}
-                {show('predicted') && showAdjusted && <col style={{ width: '6rem' }} />}
+                {show('predicted') && showAdjusted && <col style={{ width: '7rem' }} />}
                 {show('market') && <col style={{ width: '5.5rem' }} />}
-                {show('market') && showAdjusted && <col style={{ width: '6rem' }} />}
+                {show('market') && showAdjusted && <col style={{ width: '7rem' }} />}
                 {show('gap') && <col style={{ width: '6.5rem' }} />}
                 {show('ebay') && <col style={{ width: '5rem' }} />}
                 {show('flag') && <col style={{ width: '10rem' }} />}
@@ -739,7 +746,7 @@ export function Cards() {
                   {show('name') && <SortHead label="Card" col="name" sort={sort} order={order} onSort={onSortHeader} />}
                   {show('ai') && (
                     <TableHead
-                      className="whitespace-nowrap"
+                      className="truncate"
                       title="Composite score [0-1]. BUY >= 0.72, WATCH >= 0.50, PASS otherwise."
                     >
                       AI score
@@ -761,8 +768,8 @@ export function Cards() {
                     />
                   )}
                   {show('predicted') && showAdjusted && (
-                    <TableHead className="whitespace-nowrap text-xs" title={`× ${condPct}% of NM model fair`}>
-                      Adj fair ({condition})
+                    <TableHead className="truncate text-xs" title={`Adj fair × ${condPct}% (${condition})`}>
+                      Fair ({condition})
                     </TableHead>
                   )}
                   {show('market') && (
@@ -776,30 +783,30 @@ export function Cards() {
                     />
                   )}
                   {show('market') && showAdjusted && (
-                    <TableHead className="whitespace-nowrap text-xs" title={`× ${condPct}% of TCGPlayer market`}>
-                      Adj mkt ({condition})
+                    <TableHead className="truncate text-xs" title={`Adj mkt × ${condPct}% (${condition})`}>
+                      Mkt ({condition})
                     </TableHead>
                   )}
                   {show('gap') && (
                     <TableHead
-                      className="cursor-help whitespace-nowrap"
+                      className="cursor-help truncate"
                       title="Market price minus model fair. Negative = deal vs the model."
                     >
                       vs model ($)
                     </TableHead>
                   )}
                   {show('ebay') && <SortHead label="eBay" col="ebay_median" sort={sort} order={order} onSort={onSortHeader} />}
-                  {show('flag') && <TableHead className="whitespace-nowrap">Valuation</TableHead>}
+                  {show('flag') && <TableHead className="truncate">Valuation</TableHead>}
                   {show('future') && (
                     <TableHead
-                      className="whitespace-nowrap"
+                      className="truncate"
                       title="Projected 12-month value based on character popularity, rarity, trends, and price momentum"
                     >
                       12m forecast
                     </TableHead>
                   )}
                   {show('spark') && (
-                    <TableHead className="whitespace-nowrap">
+                    <TableHead className="truncate">
                       <span className="inline-flex items-center gap-1">
                         30d trend
                         <HelpButton sectionId="cards-30d-trend" />
@@ -818,7 +825,7 @@ export function Cards() {
                       <TableRow key={c.id} className="cursor-pointer" onClick={() => openDetail(c)}>
                         {show('name') && <TableCell className="truncate font-medium" title={c.name}>{c.name}</TableCell>}
                         {show('ai') && (
-                          <TableCell>
+                          <TableCell className="overflow-hidden">
                             <AiScoreBadge score={c.ai_score ?? 0} decision={c.ai_decision ?? 'PASS'} />
                           </TableCell>
                         )}
@@ -832,7 +839,7 @@ export function Cards() {
                         {show('pull') && <TableCell>{c.pull_cost_score?.toFixed(1) ?? '—'}</TableCell>}
                         {show('desire') && <TableCell>{c.desirability_score?.toFixed(1) ?? '—'}</TableCell>}
                         {show('predicted') && (
-                          <TableCell className="whitespace-nowrap">
+                          <TableCell className="overflow-hidden whitespace-nowrap">
                             <span className="tabular-nums">
                               {c.predicted_price != null ? `$${c.predicted_price.toFixed(2)}` : '—'}
                             </span>
@@ -842,13 +849,13 @@ export function Cards() {
                           </TableCell>
                         )}
                         {show('predicted') && showAdjusted && (
-                          <TableCell className="text-xs">{adjP != null ? `$${adjP.toFixed(2)}` : '—'}</TableCell>
+                          <TableCell className="overflow-hidden text-xs tabular-nums">{adjP != null ? `$${adjP.toFixed(2)}` : '—'}</TableCell>
                         )}
                         {show('market') && (
-                          <TableCell>{c.market_price != null ? `$${c.market_price.toFixed(2)}` : '—'}</TableCell>
+                          <TableCell className="overflow-hidden tabular-nums">{c.market_price != null ? `$${c.market_price.toFixed(2)}` : '—'}</TableCell>
                         )}
                         {show('market') && showAdjusted && (
-                          <TableCell className="text-xs">{adjM != null ? `$${adjM.toFixed(2)}` : '—'}</TableCell>
+                          <TableCell className="overflow-hidden text-xs tabular-nums">{adjM != null ? `$${adjM.toFixed(2)}` : '—'}</TableCell>
                         )}
                         {show('gap') && (
                           <TableCell className="whitespace-nowrap">
@@ -861,10 +868,8 @@ export function Cards() {
                           <TableCell>{c.ebay_median != null ? `$${c.ebay_median.toFixed(2)}` : '—'}</TableCell>
                         )}
                         {show('flag') && (
-                          <TableCell className="overflow-hidden">
-                            <Badge variant="outline" className="max-w-full truncate text-xs" title={c.valuation_flag ?? ''}>
-                              {c.valuation_flag ?? '—'}
-                            </Badge>
+                          <TableCell>
+                            <ValuationBadge flag={c.valuation_flag} />
                           </TableCell>
                         )}
                         {show('future') && (
@@ -1297,7 +1302,7 @@ function SortHead({
   return (
     <TableHead
       title={title}
-      className="cursor-pointer select-none whitespace-nowrap hover:bg-muted/50"
+      className="cursor-pointer select-none truncate hover:bg-muted/50"
       onClick={(e) => {
         e.stopPropagation()
         onSort(col)
@@ -1695,6 +1700,30 @@ function NegotiationCell({
       <p className="text-[0.65rem] uppercase tracking-wide text-muted-foreground">{label}</p>
       <p className="tabular-nums font-semibold">${value.toFixed(2)}</p>
     </div>
+  )
+}
+
+function ValuationBadge({ flag }: { flag: string | null | undefined }) {
+  if (!flag) return <span className="text-muted-foreground">—</span>
+  const f = flag.toUpperCase()
+  if (f.includes('UNDERVALUED')) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-500/25 dark:text-emerald-400" title={flag}>
+        <span className="text-[0.6rem]">▲</span> Buy
+      </span>
+    )
+  }
+  if (f.includes('OVERVALUED')) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-red-500/15 px-2 py-0.5 text-xs font-semibold text-red-700 ring-1 ring-inset ring-red-500/25 dark:text-red-400" title={flag}>
+        <span className="text-[0.6rem]">▼</span> Over
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-400" title={flag}>
+      — Fair
+    </span>
   )
 }
 

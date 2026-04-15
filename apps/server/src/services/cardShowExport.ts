@@ -27,9 +27,10 @@ export async function buildCardShowHtml(db: Database.Database): Promise<string> 
     .map((r) => {
       const m = r.market_price ?? 0
       const p = r.predicted_price ?? m
-      const opening = Math.max(0.85 * m, m * 0.9).toFixed(2)
-      const ideal = Math.min(p, m * 1.05).toFixed(2)
-      const maxPay = Math.min(p * 1.05, m * 1.15).toFixed(2)
+      const anchor = Math.max(m, p)
+      const opening = (anchor * 0.80).toFixed(2)
+      const ideal = (anchor * 0.87).toFixed(2)
+      const maxPay = (anchor * 0.93).toFixed(2)
       return `<tr>
         <td><img src="${r.image_url || ''}" alt="" width="56"/></td>
         <td>${escapeHtml(r.name)}</td>

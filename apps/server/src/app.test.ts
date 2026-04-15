@@ -245,3 +245,231 @@ describe('GET /api/arbitrage', () => {
     expect(Array.isArray(res.body)).toBe(true)
   })
 })
+
+describe('Model run endpoints', () => {
+  let db: ReturnType<typeof openMemoryDb>
+
+  beforeEach(() => {
+    db = openMemoryDb()
+    seedMinimalCard(db)
+  })
+
+  it('GET /api/models/progress returns full progress shape', async () => {
+    const app = createApp(db)
+    const res = await request(app).get('/api/models/progress').expect(200)
+    expect(typeof res.body.running).toBe('boolean')
+    expect(Array.isArray(res.body.completed)).toBe(true)
+    expect(Array.isArray(res.body.queued)).toBe(true)
+    expect(typeof res.body.total).toBe('number')
+    expect(typeof res.body.elapsed_ms).toBe('number')
+    expect('finished_at' in res.body).toBe(true)
+    expect('error' in res.body).toBe(true)
+  })
+
+  it('POST /api/models/run/:modelId returns 404 for unknown model', async () => {
+    const app = createApp(db)
+    await request(app).post('/api/models/run/nonexistent').expect(404)
+  })
+
+  it('POST /api/models/run-all starts a run', async () => {
+    const app = createApp(db)
+    const res = await request(app).post('/api/models/run-all').expect(200)
+    expect(res.body.ok).toBe(true)
+    expect(res.body.started_at).toBeTruthy()
+  })
+
+  it('GET /api/models/status returns array with expected fields', async () => {
+    const app = createApp(db)
+    const res = await request(app).get('/api/models/status').expect(200)
+    expect(Array.isArray(res.body)).toBe(true)
+    if (res.body.length > 0) {
+      const m = res.body[0]
+      expect(typeof m.name).toBe('string')
+      expect(typeof m.model_id).toBe('string')
+      expect(typeof m.card_coverage).toBe('number')
+      expect(typeof m.total_cards).toBe('number')
+      expect(typeof m.status).toBe('string')
+    }
+  })
+})
+
+describe('Paginated analytics endpoints', () => {
+  it('GET /api/models/momentum/cards returns paginated shape', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    const app = createApp(db)
+    const res = await request(app).get('/api/models/momentum/cards').expect(200)
+    expect(typeof res.body.items).toBe('object')
+    expect(Array.isArray(res.body.items)).toBe(true)
+    expect(typeof res.body.total).toBe('number')
+  })
+
+  it('GET /api/models/anomalies/recent returns paginated shape', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    const app = createApp(db)
+    const res = await request(app).get('/api/models/anomalies/recent').expect(200)
+    expect(Array.isArray(res.body.items)).toBe(true)
+    expect(typeof res.body.total).toBe('number')
+  })
+
+  it('GET /api/models/supply-shock/alerts returns paginated shape', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    const app = createApp(db)
+    const res = await request(app).get('/api/models/supply-shock/alerts').expect(200)
+    expect(Array.isArray(res.body.items)).toBe(true)
+    expect(typeof res.body.total).toBe('number')
+  })
+
+  it('GET /api/models/cointegration/pairs returns paginated shape', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    const app = createApp(db)
+    const res = await request(app).get('/api/models/cointegration/pairs').expect(200)
+    expect(Array.isArray(res.body.items)).toBe(true)
+    expect(typeof res.body.total).toBe('number')
+  })
+
+  it('limit and offset query params are respected', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    const app = createApp(db)
+    const res = await request(app).get('/api/models/momentum/cards?limit=1&offset=0').expect(200)
+    expect(res.body.items.length).toBeLessThanOrEqual(1)
+  })
+})
+
+describe('Negotiation pricing', () => {
+  it('negotiation prices are below market price', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    const app = createApp(db)
+    const res = await request(app).get('/api/cards/test-card-1/investment').expect(200)
+    const { negotiation } = res.body
+    expect(negotiation.opening_offer).toBeLessThan(negotiation.max_pay)
+    expect(negotiation.ideal_price).toBeLessThan(negotiation.max_pay)
+    expect(negotiation.opening_offer).toBeLessThan(negotiation.ideal_price)
+    expect(negotiation.opening_offer).toBeGreaterThan(0)
+  })
+})
+
+describe('30d sparkline / trend', () => {
+  function seedPriceHistory(
+    db: ReturnType<typeof openMemoryDb>,
+    cardId: string,
+    entries: { date: string; price: number }[],
+  ) {
+    const stmt = db.prepare(
+      `INSERT INTO price_history (card_id, timestamp, tcgplayer_market, tcgplayer_low)
+       VALUES (?, ?, ?, ?)`,
+    )
+    for (const e of entries) {
+      stmt.run(cardId, e.date, e.price, e.price * 0.9)
+    }
+  }
+
+  it('spark_30d deduplicates multiple snapshots per day to one point per date', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+    seedPriceHistory(db, 'test-card-1', [
+      { date: '2025-03-01T06:00:00Z', price: 10 },
+      { date: '2025-03-01T12:00:00Z', price: 10.1 },
+      { date: '2025-03-01T18:00:00Z', price: 10.2 },
+      { date: '2025-03-02T06:00:00Z', price: 11 },
+      { date: '2025-03-02T12:00:00Z', price: 11.1 },
+      { date: '2025-03-03T08:00:00Z', price: 12 },
+    ])
+    const app = createApp(db)
+    const res = await request(app).get('/api/cards').expect(200)
+    const spark = res.body.items[0].spark_30d
+    expect(spark.length).toBe(3)
+  })
+
+  it('spark_30d spans 30 days even with many snapshots per day', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+
+    const entries: { date: string; price: number }[] = []
+    const base = new Date('2025-03-01')
+    for (let d = 0; d < 30; d++) {
+      const day = new Date(base.getTime() + d * 86_400_000)
+      const dateStr = day.toISOString().slice(0, 10)
+      const price = 10 + d * 0.5
+      entries.push({ date: `${dateStr}T06:00:00Z`, price })
+      entries.push({ date: `${dateStr}T12:00:00Z`, price: price + 0.01 })
+      entries.push({ date: `${dateStr}T18:00:00Z`, price: price + 0.02 })
+    }
+    seedPriceHistory(db, 'test-card-1', entries)
+
+    const app = createApp(db)
+    const res = await request(app).get('/api/cards').expect(200)
+    const spark: { p: number }[] = res.body.items[0].spark_30d
+    expect(spark.length).toBe(30)
+  })
+
+  it('spark_30d first and last prices reflect actual 30-day range', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+
+    const entries: { date: string; price: number }[] = []
+    const base = new Date('2025-03-01')
+    for (let d = 0; d < 20; d++) {
+      const day = new Date(base.getTime() + d * 86_400_000)
+      const dateStr = day.toISOString().slice(0, 10)
+      const price = 10 + d
+      entries.push({ date: `${dateStr}T12:00:00Z`, price })
+    }
+    seedPriceHistory(db, 'test-card-1', entries)
+
+    const app = createApp(db)
+    const res = await request(app).get('/api/cards').expect(200)
+    const spark: { p: number }[] = res.body.items[0].spark_30d
+    expect(spark.length).toBe(20)
+    expect(spark[0].p).toBe(10)
+    expect(spark[spark.length - 1].p).toBe(29)
+  })
+
+  it('30d trend is non-zero when prices change over the period', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+
+    const entries: { date: string; price: number }[] = []
+    const base = new Date('2025-03-01')
+    for (let d = 0; d < 15; d++) {
+      const day = new Date(base.getTime() + d * 86_400_000)
+      const dateStr = day.toISOString().slice(0, 10)
+      entries.push({ date: `${dateStr}T12:00:00Z`, price: 10 + d * 2 })
+    }
+    seedPriceHistory(db, 'test-card-1', entries)
+
+    const app = createApp(db)
+    const res = await request(app).get('/api/cards').expect(200)
+    const spark: { p: number }[] = res.body.items[0].spark_30d
+    const first = spark[0].p
+    const last = spark[spark.length - 1].p
+    const changePct = ((last - first) / first) * 100
+    expect(Math.abs(changePct)).toBeGreaterThan(1)
+  })
+
+  it('spark_30d is sorted chronologically (oldest first)', async () => {
+    const db = openMemoryDb()
+    seedMinimalCard(db)
+
+    const entries: { date: string; price: number }[] = []
+    const base = new Date('2025-03-01')
+    for (let d = 0; d < 10; d++) {
+      const day = new Date(base.getTime() + d * 86_400_000)
+      const dateStr = day.toISOString().slice(0, 10)
+      entries.push({ date: `${dateStr}T12:00:00Z`, price: 10 + d })
+    }
+    seedPriceHistory(db, 'test-card-1', entries)
+
+    const app = createApp(db)
+    const res = await request(app).get('/api/cards').expect(200)
+    const spark: { p: number }[] = res.body.items[0].spark_30d
+    for (let i = 1; i < spark.length; i++) {
+      expect(spark[i].p).toBeGreaterThan(spark[i - 1].p)
+    }
+  })
+})

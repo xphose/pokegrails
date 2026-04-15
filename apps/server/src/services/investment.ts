@@ -221,16 +221,38 @@ export function computeFutureValue(input: FutureValueInput): {
   }
 }
 
-export function buildNegotiation(fairValue: number, sentimentDelta = 0): {
+/**
+ * Negotiation price tiers.
+ * `anchor` = the reference price buyers actually compete against (market).
+ * `fairValue` = model estimate (may differ from market).
+ * `sentimentDelta` = centered around 0 (negative = bearish, positive = bullish).
+ *
+ * When model fair < market (overvalued), we discount from market toward fair.
+ * When model fair >= market (undervalued), we discount from fair.
+ * Bands widen for expensive cards because sellers expect negotiation room.
+ */
+export function buildNegotiation(
+  fairValue: number,
+  sentimentDelta = 0,
+  marketPrice: number | null = null,
+): {
   opening_offer: number
   ideal_price: number
   max_pay: number
   walk_away_script: string
 } {
-  const adjust = sentimentDelta < 0 ? -0.03 : sentimentDelta > 0.2 ? 0.02 : 0
-  const opening = fairValue * (0.68 + adjust)
-  const ideal = fairValue * (0.78 + adjust)
-  const max = fairValue * (0.88 + adjust)
+  const market = marketPrice != null && marketPrice > 0 ? marketPrice : fairValue
+  const anchor = Math.max(fairValue, market)
+
+  // Wider bands for expensive cards (big-ticket items have more negotiation room)
+  const tier = anchor > 500 ? 0.03 : anchor > 100 ? 0.02 : anchor > 30 ? 0.01 : 0
+  const sentAdj = sentimentDelta < 0 ? -0.02 : sentimentDelta > 0.2 ? 0.01 : 0
+  const adj = tier + sentAdj
+
+  const opening = anchor * (0.80 - adj)
+  const ideal = anchor * (0.87 - adj * 0.5)
+  const max = anchor * (0.93)
+
   return {
     opening_offer: Math.max(0, Number(opening.toFixed(2))),
     ideal_price: Math.max(0, Number(ideal.toFixed(2))),

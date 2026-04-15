@@ -1,13 +1,26 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 import { cn } from '@/lib/utils'
 import { applyThemeMode, getStoredThemeMode, setStoredThemeMode, type ThemeMode } from '@/lib/theme'
 import { HelpMenuButton } from '@/components/help-center'
 
+const prefetchMap: Record<string, () => Promise<unknown>> = {
+  '/': () => import('@/pages/Dashboard'),
+  '/sets': () => import('@/pages/Sets'),
+  '/cards': () => import('@/pages/Cards'),
+  '/analytics': () => import('@/pages/Analytics'),
+  '/alerts': () => import('@/pages/Alerts'),
+  '/watchlist': () => import('@/pages/Watchlist'),
+  '/signals': () => import('@/pages/BuySignals'),
+  '/track-record': () => import('@/pages/TrackRecord'),
+  '/card-show': () => import('@/pages/CardShow'),
+}
+
 const tabs = [
   { to: '/', label: 'Dashboard', end: true },
   { to: '/sets', label: 'Sets', end: false },
   { to: '/cards', label: 'Cards', end: false },
+  { to: '/analytics', label: 'Analytics', end: false },
   { to: '/alerts', label: 'Alerts', end: false },
   { to: '/watchlist', label: 'Watchlist', end: false },
   { to: '/signals', label: 'Buy Signals', end: false },
@@ -28,6 +41,10 @@ export function Layout() {
   useEffect(() => {
     setMobileNavOpen(false)
   }, [location.pathname])
+
+  const prefetch = useCallback((to: string) => {
+    prefetchMap[to]?.()
+  }, [])
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
@@ -88,6 +105,8 @@ export function Layout() {
                 key={t.to}
                 to={t.to}
                 end={t.end}
+                onMouseEnter={() => prefetch(t.to)}
+                onFocus={() => prefetch(t.to)}
                 className={({ isActive }) =>
                   cn(
                     'shrink-0 rounded-md px-3 py-1.5 text-sm transition-colors whitespace-nowrap',
@@ -113,6 +132,8 @@ export function Layout() {
                   key={t.to}
                   to={t.to}
                   end={t.end}
+                  onTouchStart={() => prefetch(t.to)}
+                  onFocus={() => prefetch(t.to)}
                   className={({ isActive }) =>
                     cn(
                       'rounded-md px-3 py-2.5 text-sm font-medium transition-colors',
