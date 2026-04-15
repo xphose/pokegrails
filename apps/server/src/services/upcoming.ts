@@ -6,7 +6,9 @@ import type Database from 'better-sqlite3'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export function seedUpcomingSets(db: Database.Database) {
-  const raw = fs.readFileSync(path.join(__dirname, '../data/upcoming-sets-seed.json'), 'utf8')
+  const seedPath = path.join(__dirname, '../data/upcoming-sets-seed.json')
+  if (!fs.existsSync(seedPath)) return
+  const raw = fs.readFileSync(seedPath, 'utf8')
   const rows = JSON.parse(raw) as { id: string; name: string; release_date: string; source: string }[]
   const stmt = db.prepare(
     `INSERT INTO upcoming_sets (id, name, release_date, source) VALUES (@id, @name, @release_date, @source)
