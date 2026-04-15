@@ -2,7 +2,7 @@ import { config } from './config.js'
 import { getDb } from './db/connection.js'
 import { createApp } from './app.js'
 import { configureWebPush } from './services/push.js'
-import { fullRefresh, startCronJobs } from './services/cron.js'
+import { fullRefresh, startCronJobs, setRefreshing } from './services/cron.js'
 import { seedUpcomingSets } from './services/upcoming.js'
 import { seedMissingPriceHistory } from './services/priceHistory.js'
 
@@ -12,10 +12,13 @@ seedUpcomingSets(db)
 startCronJobs(db)
 
 setImmediate(async () => {
+  setRefreshing(true)
   try {
     await fullRefresh(db)
   } catch (e) {
     console.error('Initial ingest failed', e)
+  } finally {
+    setRefreshing(false)
   }
   seedMissingPriceHistory(db)
 })

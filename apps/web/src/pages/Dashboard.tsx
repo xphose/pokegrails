@@ -405,7 +405,7 @@ export function Dashboard() {
   })
   const qCards = useQuery({
     queryKey: ['api', 'cards', 'dashboard'],
-    queryFn: () => api<CardsListResponse>('/api/cards?limit=2500&offset=0'),
+    queryFn: () => api<CardsListResponse>('/api/cards?limit=25000&offset=0'),
     staleTime: 60_000,
   })
   // Pulse data is folded into social momentum via card-level reddit_buzz_score

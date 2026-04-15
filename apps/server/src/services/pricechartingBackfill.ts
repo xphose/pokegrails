@@ -212,7 +212,7 @@ export interface BackfillStats {
   errors: number
 }
 
-export async function runPricechartingBackfill(db: Database.Database): Promise<BackfillStats> {
+export async function runPricechartingBackfill(db: Database.Database, opts: { force?: boolean } = {}): Promise<BackfillStats> {
   const token = config.pricechartingApiKey
   if (!token) {
     console.log('[pc-backfill] No PRICECHARTING_API_KEY configured, aborting')
@@ -311,7 +311,7 @@ export async function runPricechartingBackfill(db: Database.Database): Promise<B
     const meta = pcMeta.get(card.id)!
 
     const histCount = (hasHistStmt.get(card.id) as { c: number }).c
-    if (histCount >= 6) {
+    if (!opts.force && histCount >= 6) {
       stats.cardsScraped++
       continue
     }
@@ -354,7 +354,7 @@ export async function runPricechartingBackfill(db: Database.Database): Promise<B
         )
         .get(entry.setId) as { c: number }
     ).c
-    if (existing >= 6) {
+    if (!opts.force && existing >= 6) {
       stats.sealedScraped++
       continue
     }

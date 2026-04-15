@@ -171,6 +171,9 @@ function ModelStatusPanel() {
   const qc = useQueryClient()
   const { data, isLoading } = useQuery({ queryKey: ['model-status'], queryFn: () => api<ModelStatus[]>('/api/models/status'), staleTime: STALE_5M })
 
+  const [dismissedFinish, setDismissedFinish] = useState(false)
+  const prevRunningRef = useRef(false)
+
   const { data: progress } = useQuery({
     queryKey: ['run-progress'],
     queryFn: () => api<RunProgress>('/api/models/progress'),
@@ -181,9 +184,6 @@ function ModelStatusPanel() {
       return false
     },
   })
-
-  const [dismissedFinish, setDismissedFinish] = useState(false)
-  const prevRunningRef = useRef(false)
 
   useEffect(() => {
     if (prevRunningRef.current && progress && !progress.running) {

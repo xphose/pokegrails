@@ -35,17 +35,22 @@ export async function fetchSet(setId: string) {
   return ptcgGet<R>(`/sets/${setId}`)
 }
 
-export async function fetchAllTargetSets() {
-  const found: Record<string, unknown>[] = []
-  for (const id of config.targetSetIds) {
-    try {
-      const r = await fetchSet(id)
-      found.push(r.data as Record<string, unknown>)
-    } catch {
-      /* set may not exist yet */
-    }
+/**
+ * Fetch every set from the PokémonTCG.io catalog (paginated).
+ * Replaces the old hardcoded `targetSetIds` whitelist approach.
+ */
+export async function fetchAllSets(): Promise<Record<string, unknown>[]> {
+  const all: Record<string, unknown>[] = []
+  let page = 1
+  while (true) {
+    type R = { data: Record<string, unknown>[]; totalCount: number }
+    const res = await ptcgGet<R>(`/sets`, `?page=${page}&pageSize=250&orderBy=releaseDate`)
+    all.push(...res.data)
+    if (all.length >= res.totalCount || res.data.length === 0) break
+    page += 1
   }
-  return found
+  console.log(`[ingest] Fetched ${all.length} sets from PokémonTCG.io`)
+  return all
 }
 
 export interface TcgPriceEnvelope {
@@ -335,14 +340,21 @@ export function upsertSetRow(db: Database.Database, set: Record<string, unknown>
   })
 }
 
+const ingestSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
 export async function ingestPokemonTcg(db: Database.Database) {
-  const sets = await fetchAllTargetSets()
+  const sets = await fetchAllSets()
   for (const s of sets) upsertSetRow(db, s)
-  for (const s of sets) {
+  for (let i = 0; i < sets.length; i++) {
+    const s = sets[i]
     const id = String(s.id)
+    const name = String(s.name || id)
+    console.log(`[ingest] ${i + 1}/${sets.length} — fetching cards for ${name} (${id})`)
     const cards = await fetchCardsForSet(id)
     upsertCardsFromApi(db, id, cards)
+    if (i < sets.length - 1) await ingestSleep(200)
   }
+  console.log(`[ingest] Complete — ${sets.length} sets ingested`)
 }
 
 /** Re-apply parseCharacterName to all rows (call after parser fixes; no API fetch needed). */

@@ -572,11 +572,12 @@ export function createApp(db: Database) {
     res.json({ ok: true })
   })
 
-  app.post('/api/internal/backfill-pricecharting', async (_req, res) => {
+  app.post('/api/internal/backfill-pricecharting', async (req, res) => {
     const { runPricechartingBackfill } = await import('./services/pricechartingBackfill.js')
-    res.json({ ok: true, message: 'Backfill started in background — watch server console for progress' })
+    const force = req.query.force === '1' || req.query.force === 'true'
+    res.json({ ok: true, message: `Backfill started in background (force=${force}) — watch server console for progress` })
     try {
-      const stats = await runPricechartingBackfill(db)
+      const stats = await runPricechartingBackfill(db, { force })
       console.log('[backfill] Finished:', stats)
     } catch (e) {
       console.error('[backfill] Failed:', e)

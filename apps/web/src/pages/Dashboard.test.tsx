@@ -46,7 +46,7 @@ function mockDashboardApi(fixture: DashboardApiFixture) {
       avgModelAccuracy: 0.88,
       portfolioValue: 0,
     },
-    '/api/cards?limit=2500&offset=0': {
+    '/api/cards?limit=25000&offset=0': {
       items: fixture.cards,
       total: fixture.cards.length,
       limit: 2500,

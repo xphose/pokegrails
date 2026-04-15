@@ -12,6 +12,7 @@ import { refreshSealedPrices, seedSealedPrices } from './sealedPrices.js'
 import { takePredictionSnapshot } from './trackRecord.js'
 
 let refreshing = false
+export function setRefreshing(v: boolean) { refreshing = v }
 
 export function startCronJobs(db: Database.Database) {
   const safe = (name: string, fn: () => void | Promise<void>) => async () => {

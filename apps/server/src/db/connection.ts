@@ -12,6 +12,7 @@ export function getDb(): Database.Database {
   fs.mkdirSync(dir, { recursive: true })
   const db = new Database(config.databasePath)
   db.pragma('journal_mode = WAL')
+  db.pragma('busy_timeout = 10000')
   runMigrations(db)
   dbInstance = db
   return db
