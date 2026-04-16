@@ -387,7 +387,7 @@ export function createApp(db: Database) {
     const params: string[] = [...(setIdFilter ? [setIdFilter] : []), ...(tier ? tier.ids : [])]
     const rows = db
       .prepare(
-        `SELECT * FROM cards WHERE valuation_flag LIKE '%UNDERVALUED%'${whereSet}${tierSql}
+        `SELECT * FROM cards WHERE (valuation_flag LIKE '%UNDERVALUED%' OR valuation_flag LIKE '%GROWTH%')${whereSet}${tierSql}
          ORDER BY ${orderBy} LIMIT 200`,
       )
       .all(...params)

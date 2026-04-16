@@ -145,7 +145,7 @@ export function saveWatchlistForm(f: WatchlistFormPersisted) {
 
 const DASH_PREFS = 'pokeedge_dashboard_prefs'
 
-export type DashboardValuationFilter = 'all' | 'under' | 'over' | 'fair'
+export type DashboardValuationFilter = 'all' | 'under' | 'over' | 'fair' | 'growth'
 
 /** Which main visualization to show — each answers a different question. */
 export type DashboardChartKind =
@@ -195,7 +195,7 @@ export function loadDashboardPrefs(): DashboardPrefs {
     const j = JSON.parse(raw) as Partial<DashboardPrefs>
     const v = j.valuation
     const valuation: DashboardValuationFilter =
-      v === 'under' || v === 'over' || v === 'fair' || v === 'all' ? v : 'all'
+      v === 'under' || v === 'over' || v === 'fair' || v === 'all' || v === 'growth' ? v : 'all'
     const ck = j.chartKind
     const chartKind: DashboardChartKind =
       ck === 'pull_desire' || ck === 'fair_market' || ck === 'deal_mix' || ck === 'sets_rank' ? ck : 'pull_desire'

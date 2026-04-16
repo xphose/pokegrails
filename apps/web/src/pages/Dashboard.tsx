@@ -357,6 +357,7 @@ function RawScatter({
 
 function flagColor(flag: string | null) {
   if (!flag) return 'hsl(var(--chart-3))'
+  if (flag.includes('GROWTH')) return 'oklch(0.65 0.18 250)'
   if (flag.includes('OVERVALUED')) return 'oklch(0.62 0.22 25)'
   if (flag.includes('UNDERVALUED')) return 'oklch(0.72 0.2 145)'
   return 'oklch(0.78 0.16 85)'
@@ -364,6 +365,7 @@ function flagColor(flag: string | null) {
 
 function flagLabel(flag: string | null): string {
   if (!flag) return 'Unknown'
+  if (flag.includes('GROWTH')) return 'Growth Buy'
   if (flag.includes('OVERVALUED')) return 'Overvalued'
   if (flag.includes('UNDERVALUED')) return 'Undervalued'
   return 'Fair'
@@ -374,7 +376,8 @@ function matchesValuation(c: CardRow, v: DashboardPrefs['valuation']): boolean {
   if (v === 'all') return true
   if (v === 'under') return f.includes('UNDERVALUED')
   if (v === 'over') return f.includes('OVERVALUED')
-  return f.includes('FAIRLY') || (!f.includes('UNDER') && !f.includes('OVER'))
+  if (v === 'growth') return f.includes('GROWTH')
+  return f.includes('FAIRLY') || (!f.includes('UNDER') && !f.includes('OVER') && !f.includes('GROWTH'))
 }
 
 export function Dashboard() {
@@ -504,10 +507,19 @@ export function Dashboard() {
     return list
   }, [cards, dashPrefs.scatterSetId, dashPrefs.valuation, dashPrefs.minFairValueUsd])
 
-  const filteredForScatter = useMemo(
-    () => filteredCards.filter((c) => c.pull_cost_score != null && c.desirability_score != null),
-    [filteredCards],
-  )
+  const filteredForScatter = useMemo(() => {
+    const scored = filteredCards.filter(
+      (c) => c.pull_cost_score != null && c.desirability_score != null,
+    )
+    const priority = (f: string | null) => {
+      if (f?.includes('UNDERVALUED')) return 0
+      if (f?.includes('GROWTH')) return 1
+      if (f?.includes('OVERVALUED')) return 3
+      return 2
+    }
+    scored.sort((a, b) => priority(a.valuation_flag) - priority(b.valuation_flag))
+    return scored
+  }, [filteredCards])
 
   const scatterData: ScatterPt[] = useMemo(
     () =>
@@ -652,6 +664,18 @@ export function Dashboard() {
       .sort((a, b) => b.disc - a.disc)
       .slice(0, 8)
   }, [cards, dashPrefs.minDealPercent, dashPrefs.minFairValueUsd])
+
+  const topGrowth = useMemo(() => {
+    return [...cards]
+      .filter(
+        (c) =>
+          (c.valuation_flag?.includes('GROWTH') || (c.annual_growth_rate ?? 0) >= 0.10) &&
+          (c.market_price ?? 0) > 0 &&
+          (c.future_value_12m ?? 0) > 0,
+      )
+      .sort((a, b) => (b.annual_growth_rate ?? 0) - (a.annual_growth_rate ?? 0))
+      .slice(0, 8)
+  }, [cards])
 
   const selectedCard = useMemo(() => {
     if (selectedId == null) return undefined
@@ -843,6 +867,7 @@ export function Dashboard() {
                 >
                   <option value="all">All</option>
                   <option value="under">Undervalued</option>
+                  <option value="growth">Growth Buy</option>
                   <option value="over">Overvalued</option>
                   <option value="fair">Fairly valued</option>
                 </select>
@@ -940,6 +965,10 @@ export function Dashboard() {
                 <span className="inline-flex items-center gap-1.5">
                   <span className="size-2.5 rounded-full bg-[oklch(0.72_0.2_145)]" />
                   Undervalued
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="size-2.5 rounded-full bg-[oklch(0.65_0.18_250)]" />
+                  Growth Buy
                 </span>
                 <span className="inline-flex items-center gap-1.5">
                   <span className="size-2.5 rounded-full bg-[oklch(0.78_0.16_85)]" />
@@ -1180,7 +1209,8 @@ export function Dashboard() {
                       variant="outline"
                       className={cn(
                         selectedCard.valuation_flag?.includes('UNDERVALUED') && 'border-emerald-500/50 text-emerald-600 dark:text-emerald-400',
-                        selectedCard.valuation_flag?.includes('OVERVALUED') && 'border-red-500/50 text-red-600 dark:text-red-400',
+                        selectedCard.valuation_flag?.includes('GROWTH') && 'border-sky-500/50 text-sky-600 dark:text-sky-400',
+                        selectedCard.valuation_flag?.includes('OVERVALUED') && !selectedCard.valuation_flag?.includes('GROWTH') && 'border-red-500/50 text-red-600 dark:text-red-400',
                       )}
                     >
                       {flagLabel(selectedCard.valuation_flag)}
@@ -1203,6 +1233,22 @@ export function Dashboard() {
                   <dd className="tabular-nums font-medium text-sky-600 dark:text-sky-400">
                     {selectedCard.market_price != null ? `$${selectedCard.market_price.toFixed(2)}` : '—'}
                   </dd>
+                  {selectedCard.future_value_12m != null && selectedCard.future_value_12m > 0 && (
+                    <>
+                      <dt className="text-muted-foreground">12m projected</dt>
+                      <dd className="tabular-nums font-medium text-sky-600 dark:text-sky-400">
+                        ${selectedCard.future_value_12m.toFixed(2)}
+                      </dd>
+                    </>
+                  )}
+                  {selectedCard.annual_growth_rate != null && selectedCard.annual_growth_rate > 0 && (
+                    <>
+                      <dt className="text-muted-foreground">Growth rate</dt>
+                      <dd className="tabular-nums font-semibold text-sky-600 dark:text-sky-400">
+                        +{(selectedCard.annual_growth_rate * 100).toFixed(0)}%
+                      </dd>
+                    </>
+                  )}
                 </dl>
                 <Separator />
                 <div className="flex flex-wrap gap-2">
@@ -1321,6 +1367,71 @@ export function Dashboard() {
         </Card>
         )}
       </div>
+
+      {qCards.isPending ? (
+        <div className="h-48 animate-pulse rounded-xl border border-border bg-muted/40" />
+      ) : topGrowth.length > 0 && (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-1">
+            <CardTitle className="text-base">Growth opportunities</CardTitle>
+            <HelpButton sectionId="dashboard-overview" />
+          </div>
+          <CardDescription>
+            Cards with strong 12-month projected growth — may be overvalued today but attractive for long-term upside.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            {topGrowth.map((c) => {
+              const growth = (c.annual_growth_rate ?? 0) * 100
+              const mkt = c.market_price ?? 0
+              const proj = c.future_value_12m ?? 0
+              const isGrowthFlag = c.valuation_flag?.includes('GROWTH')
+              return (
+                <button
+                  key={c.id}
+                  type="button"
+                  className="flex flex-col gap-1.5 rounded-lg border border-border p-3 text-left transition-colors hover:border-sky-400/50 hover:bg-sky-50/50 dark:hover:bg-sky-950/20"
+                  onClick={() => setSelectedId(c.id)}
+                >
+                  <span className="text-sm font-medium leading-snug line-clamp-2">{c.name}</span>
+                  <div className="flex items-center gap-1.5">
+                    {isGrowthFlag && (
+                      <span className="inline-flex items-center gap-0.5 rounded bg-sky-500/15 px-1.5 py-0.5 text-[0.65rem] font-semibold text-sky-700 ring-1 ring-inset ring-sky-500/25 dark:text-sky-400">
+                        ⬆ Growth Buy
+                      </span>
+                    )}
+                    <span className="text-xs text-muted-foreground">{c.set_id}</span>
+                  </div>
+                  <div className="mt-auto flex items-baseline justify-between gap-2">
+                    <div className="text-xs">
+                      <span className="text-muted-foreground">Now </span>
+                      <span className="font-medium tabular-nums">${mkt.toFixed(2)}</span>
+                    </div>
+                    <div className="text-right text-xs">
+                      <span className="text-muted-foreground">12m </span>
+                      <span className="font-semibold tabular-nums text-sky-600 dark:text-sky-400">${proj.toFixed(2)}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="h-1.5 flex-1 rounded-full bg-muted">
+                      <div
+                        className="h-1.5 rounded-full bg-sky-500/70 transition-all"
+                        style={{ width: `${Math.min(100, growth)}%` }}
+                      />
+                    </div>
+                    <span className="text-xs font-semibold tabular-nums text-sky-600 dark:text-sky-400">
+                      +{growth.toFixed(0)}%
+                    </span>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        </CardContent>
+      </Card>
+      )}
 
       {qCards.isPending ? (
         <div className="grid gap-3 sm:gap-4 lg:grid-cols-2">

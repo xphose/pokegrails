@@ -1721,6 +1721,13 @@ function ValuationBadge({ flag }: { flag: string | null | undefined }) {
       </span>
     )
   }
+  if (f.includes('GROWTH')) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-sky-500/15 px-2 py-0.5 text-xs font-semibold text-sky-700 ring-1 ring-inset ring-sky-500/25 dark:text-sky-400" title={flag}>
+        <span className="text-[0.6rem]">⬆</span> Growth
+      </span>
+    )
+  }
   if (f.includes('OVERVALUED')) {
     return (
       <span className="inline-flex items-center gap-1 rounded-md bg-red-500/15 px-2 py-0.5 text-xs font-semibold text-red-700 ring-1 ring-inset ring-red-500/25 dark:text-red-400" title={flag}>

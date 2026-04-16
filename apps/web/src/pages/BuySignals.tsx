@@ -116,7 +116,7 @@ export function BuySignals() {
             <HelpButton sectionId="signals-overview" />
           </div>
           <p className="mt-1 max-w-2xl text-xs text-muted-foreground sm:text-sm">
-            Undervalued candidates ranked by discount, savings, price, or set.
+            Undervalued and growth buy candidates ranked by discount, savings, price, or set.
           </p>
           <div className="mt-2"><UpgradeBanner /></div>
         </div>
