@@ -26,6 +26,8 @@ import { saveModelResult } from '../modelStore.js'
 let refreshing = false
 export function setRefreshing(v: boolean) { refreshing = v }
 
+const yieldEventLoop = () => new Promise<void>(resolve => setImmediate(resolve))
+
 export function startCronJobs(db: Database.Database) {
   const safe = (name: string, fn: () => void | Promise<void>) => async () => {
     if (refreshing) return
@@ -89,11 +91,13 @@ export function hydrateFromDb(db: Database.Database) {
   console.log(`[analytics] Hydrated ${count} model results from SQLite — instant startup`)
 }
 
-function runAnalyticsModels(db: Database.Database) {
+async function runAnalyticsModels(db: Database.Database) {
   console.log('[analytics] Pre-warming shared data caches...')
   const t0 = Date.now()
   loadCardFeatures(db)
+  await yieldEventLoop()
   loadAllPriceHistory(db)
+  await yieldEventLoop()
   console.log(`[analytics] Shared caches warm in ${Date.now() - t0}ms`)
 
   const models: [string, () => unknown][] = [
@@ -124,6 +128,7 @@ function runAnalyticsModels(db: Database.Database) {
     ['sentiment-negative', () => getTopSentiment(db, 'negative')],
   ]
   for (const [name, run] of models) {
+    await yieldEventLoop()
     const start = Date.now()
     try {
       const result = run()
@@ -136,12 +141,16 @@ function runAnalyticsModels(db: Database.Database) {
 export async function fullRefresh(db: Database.Database) {
   seedSealedPrices(db)
   await ingestPokemonTcg(db)
+  await yieldEventLoop()
   runFullModel(db)
+  await yieldEventLoop()
   recordPriceSnapshot(db)
   takePredictionSnapshot(db)
+  await yieldEventLoop()
   await refreshSealedPrices(db).catch(() => {})
+  await yieldEventLoop()
   refreshSetMetrics(db)
   invalidateAllPriceHistoryCache()
   cacheInvalidateAll()
-  runAnalyticsModels(db)
+  await runAnalyticsModels(db)
 }
