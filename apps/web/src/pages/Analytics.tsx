@@ -39,7 +39,6 @@ type AnomalyEvent = {
   z_score: number; type: string; magnitude_pct: number; image_url: string | null
 }
 type ClusterData = {
-  assignments: { card_id: string; name: string; cluster_id: number; archetype: string; archetype_color: string; confidence: number }[]
   profiles: { cluster_id: number; archetype: string; archetype_color: string; description: string; card_count: number; avg_price: number; avg_volatility: number; avg_growth: number }[]
 }
 type PCAResult = {

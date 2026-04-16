@@ -734,7 +734,10 @@ export function createApp(db: Database) {
     res.json(bayesianEstimate(db, String(req.params.cardId)))
   })
 
-  app.get('/api/models/clusters/all', ...premiumAuth, cachedJson(300_000, () => runClustering(db)))
+  app.get('/api/models/clusters/all', ...premiumAuth, cachedJson(300_000, () => {
+    const { profiles } = runClustering(db)
+    return { profiles }
+  }))
 
   app.get('/api/models/clusters/:cardId', ...premiumAuth, (req, res) => {
     res.json(getCardCluster(db, String(req.params.cardId)))
