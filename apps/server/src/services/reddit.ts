@@ -10,6 +10,44 @@ const SUBS = [
   'PokemonTCGDeals',
 ]
 
+const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID ?? ''
+const REDDIT_CLIENT_SECRET = process.env.REDDIT_CLIENT_SECRET ?? ''
+const REDDIT_UA = 'PokeGrails/1.0 (by /u/pokegrails)'
+
+let oauthToken: { token: string; expiresAt: number } | null = null
+
+async function getOAuthToken(): Promise<string | null> {
+  if (!REDDIT_CLIENT_ID || !REDDIT_CLIENT_SECRET) return null
+  if (oauthToken && Date.now() < oauthToken.expiresAt) return oauthToken.token
+  try {
+    const creds = Buffer.from(`${REDDIT_CLIENT_ID}:${REDDIT_CLIENT_SECRET}`).toString('base64')
+    const res = await fetch('https://www.reddit.com/api/v1/access_token', {
+      method: 'POST',
+      headers: {
+        'User-Agent': REDDIT_UA,
+        'Authorization': `Basic ${creds}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    })
+    if (!res.ok) {
+      console.warn(`[reddit] OAuth token request failed: ${res.status}`)
+      return null
+    }
+    const data = await res.json() as { access_token?: string; expires_in?: number }
+    if (!data.access_token) return null
+    oauthToken = {
+      token: data.access_token,
+      expiresAt: Date.now() + ((data.expires_in ?? 3600) - 60) * 1000,
+    }
+    console.log('[reddit] OAuth token acquired')
+    return oauthToken.token
+  } catch (e) {
+    console.warn(`[reddit] OAuth token error: ${e instanceof Error ? e.message : e}`)
+    return null
+  }
+}
+
 function extractCharacterName(fullName: string): string | null {
   const cleaned = fullName
     .replace(/\b(ex|EX|GX|gx|VMAX|VSTAR|V|vmax|vstar)\b/g, '')
@@ -36,20 +74,34 @@ export async function pollRedditAndScoreBuzz(db: Database.Database) {
     }
   }
 
+  const token = await getOAuthToken()
+  const useOAuth = !!token
+  if (useOAuth) {
+    console.log('[reddit] Using OAuth API (oauth.reddit.com)')
+  } else if (REDDIT_CLIENT_ID) {
+    console.warn('[reddit] OAuth credentials set but token acquisition failed, trying public API')
+  } else {
+    console.log('[reddit] No OAuth credentials (REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET), using public API')
+  }
+
   const mentions = new Map<string, number>()
   let totalPosts = 0
   let subsOk = 0
   let subsFailed = 0
 
   for (const sub of SUBS) {
-    const url = `https://www.reddit.com/r/${sub}/new.json?limit=100`
+    const url = useOAuth
+      ? `https://oauth.reddit.com/r/${sub}/new.json?limit=100`
+      : `https://www.reddit.com/r/${sub}/new.json?limit=100`
+    const headers: Record<string, string> = {
+      'User-Agent': REDDIT_UA,
+      'Accept': 'application/json',
+    }
+    if (useOAuth && token) {
+      headers['Authorization'] = `Bearer ${token}`
+    }
     try {
-      const res = await fetchWithRetry(url, {
-        headers: {
-          'User-Agent': 'PokeGrails/1.0 (local research)',
-          'Accept': 'application/json',
-        },
-      })
+      const res = await fetchWithRetry(url, { headers })
       if (!res.ok) {
         console.warn(`[reddit] r/${sub} returned ${res.status}`)
         subsFailed++
@@ -93,7 +145,7 @@ export async function pollRedditAndScoreBuzz(db: Database.Database) {
   }
 
   if (subsFailed === SUBS.length) {
-    console.warn(`[reddit] All ${SUBS.length} subs failed — likely rate-limited. Skipping score decay.`)
+    console.warn(`[reddit] All ${SUBS.length} subs failed — likely rate-limited or blocked. Skipping score decay.`)
     return { matched: 0, totalCards: cards.length }
   }
 

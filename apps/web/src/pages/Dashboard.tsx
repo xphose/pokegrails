@@ -521,11 +521,36 @@ export function Dashboard() {
     return scored
   }, [filteredCards])
 
-  const scatterData: ScatterPt[] = useMemo(
-    () =>
-      filteredForScatter.slice(0, 500).map((c) => ({
-        x: c.pull_cost_score ?? 0,
-        y: c.desirability_score ?? 0,
+  const scatterData: ScatterPt[] = useMemo(() => {
+    const pts = filteredForScatter.slice(0, 500).map((c) => ({
+      x: c.pull_cost_score ?? 0,
+      y: c.desirability_score ?? 0,
+      z: Math.max(1, c.predicted_price ?? c.market_price ?? 1),
+      name: c.name,
+      flag: c.valuation_flag,
+      id: c.id,
+      set_id: c.set_id,
+      market: c.market_price,
+      predicted: c.predicted_price,
+      dealPct: dealPct(c),
+    }))
+    const renderPriority = (f: string | null) => {
+      if (f?.includes('UNDERVALUED')) return 3
+      if (f?.includes('GROWTH')) return 2
+      if (f?.includes('OVERVALUED')) return 0
+      return 1
+    }
+    pts.sort((a, b) => renderPriority(a.flag) - renderPriority(b.flag))
+    return pts
+  }, [filteredForScatter])
+
+  const fairMarketData: ScatterPt[] = useMemo(() => {
+    const pts = filteredCards
+      .filter((c) => (c.market_price ?? 0) > 0 && (c.predicted_price ?? 0) > 0)
+      .slice(0, 500)
+      .map((c) => ({
+        x: c.market_price ?? 0,
+        y: c.predicted_price ?? 0,
         z: Math.max(1, c.predicted_price ?? c.market_price ?? 1),
         name: c.name,
         flag: c.valuation_flag,
@@ -534,29 +559,16 @@ export function Dashboard() {
         market: c.market_price,
         predicted: c.predicted_price,
         dealPct: dealPct(c),
-      })),
-    [filteredForScatter],
-  )
-
-  const fairMarketData: ScatterPt[] = useMemo(
-    () =>
-      filteredCards
-        .filter((c) => (c.market_price ?? 0) > 0 && (c.predicted_price ?? 0) > 0)
-        .slice(0, 500)
-        .map((c) => ({
-          x: c.market_price ?? 0,
-          y: c.predicted_price ?? 0,
-          z: Math.max(1, c.predicted_price ?? c.market_price ?? 1),
-          name: c.name,
-          flag: c.valuation_flag,
-          id: c.id,
-          set_id: c.set_id,
-          market: c.market_price,
-          predicted: c.predicted_price,
-          dealPct: dealPct(c),
-        })),
-    [filteredCards],
-  )
+      }))
+    const renderPriority = (f: string | null) => {
+      if (f?.includes('UNDERVALUED')) return 3
+      if (f?.includes('GROWTH')) return 2
+      if (f?.includes('OVERVALUED')) return 0
+      return 1
+    }
+    pts.sort((a, b) => renderPriority(a.flag) - renderPriority(b.flag))
+    return pts
+  }, [filteredCards])
 
   const fairMarketMax = useMemo(() => {
     let m = 10
