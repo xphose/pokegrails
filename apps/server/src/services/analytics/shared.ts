@@ -73,7 +73,7 @@ export function loadPriceHistory(db: Database.Database, cardId: string): PricePo
   return deduplicateDaily(rows)
 }
 
-let allPriceHistoryCache: { data: Map<string, PricePoint[]>; expiresAt: number } | null = null
+let allPriceHistoryCache: { data: Map<string, PricePoint[]>; expiresAt: number; maxDays: number } | null = null
 const ALL_PRICE_HISTORY_TTL = 300_000
 
 export function invalidateAllPriceHistoryCache(): void {
@@ -82,7 +82,7 @@ export function invalidateAllPriceHistoryCache(): void {
 
 export function loadAllPriceHistory(db: Database.Database, maxDays = 180): Map<string, PricePoint[]> {
   const now = Date.now()
-  if (allPriceHistoryCache && now < allPriceHistoryCache.expiresAt) {
+  if (allPriceHistoryCache && now < allPriceHistoryCache.expiresAt && maxDays <= allPriceHistoryCache.maxDays) {
     return allPriceHistoryCache.data
   }
 
@@ -107,7 +107,7 @@ export function loadAllPriceHistory(db: Database.Database, maxDays = 180): Map<s
     map.set(cardId, deduplicateDaily(raw))
   }
 
-  allPriceHistoryCache = { data: map, expiresAt: now + ALL_PRICE_HISTORY_TTL }
+  allPriceHistoryCache = { data: map, expiresAt: now + ALL_PRICE_HISTORY_TTL, maxDays }
   return map
 }
 

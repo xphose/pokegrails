@@ -40,7 +40,7 @@ export function detectAnomalies(
   const { cardId, days = 30 } = options
   const cutoff = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10)
 
-  const allHistory = loadAllPriceHistory(db)
+  const allHistory = loadAllPriceHistory(db, 60)
   type CardInfo = { id: string; name: string; image_url: string | null; set_name: string | null; rarity: string | null; market_price: number }
   const cardInfoStmt = db.prepare(`
     SELECT c.id, c.name, c.image_url, c.rarity, c.market_price, s.name AS set_name

@@ -94,4 +94,10 @@ export function runMigrations(db: Database.Database) {
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_price_history_timestamp ON price_history(timestamp)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_price_history_card_ts ON price_history(card_id, timestamp)`)
+
+  db.exec(`CREATE TABLE IF NOT EXISTS model_results (
+    model_id TEXT PRIMARY KEY,
+    result_json TEXT NOT NULL,
+    computed_at TEXT NOT NULL
+  )`)
 }

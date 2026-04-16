@@ -39,7 +39,7 @@ export function detectSupplyShocks(db: Database.Database): SupplyShockAlert[] {
     predicted_price: number | null; set_name: string | null
   }[]
 
-  const allHistory = loadAllPriceHistory(db)
+  const allHistory = loadAllPriceHistory(db, 60)
   const alerts: SupplyShockAlert[] = []
 
   for (const card of cards) {

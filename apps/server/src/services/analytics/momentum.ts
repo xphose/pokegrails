@@ -19,7 +19,7 @@ export type MomentumCard = {
 
 export function detectMomentumCards(db: Database.Database, limit = 50): MomentumCard[] {
   recordModelRun('lstm-momentum')
-  const allHistory = loadAllPriceHistory(db)
+  const allHistory = loadAllPriceHistory(db, 60)
   const cards = db.prepare(`
     SELECT c.id, c.name, c.set_id, c.image_url, c.market_price, c.rarity,
            s.name AS set_name

@@ -38,7 +38,7 @@ export function cachedJson(
   compute: (req: Request) => unknown,
 ): (req: Request, res: Response) => void {
   return (req, res) => {
-    const key = `GET:${req.path}`
+    const key = `GET:${req.originalUrl}`
     const hit = cacheGet(key)
     if (hit) return res.type('json').send(hit)
     const body = compute(req)

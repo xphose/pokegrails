@@ -38,6 +38,7 @@ import {
   getModelRunTime, getRunProgress, isRunning, startRun,
   updateRunProgress, completeRunStep, finishRun,
 } from './services/analytics/shared.js'
+import { loadModelResult } from './modelStore.js'
 import { authRoutes } from './routes/auth.js'
 import { stripeRoutes, stripeWebhookRoute } from './routes/stripe.js'
 import { authenticate, optionalAuth, requireAdmin, requireRole, isFreeUser, freeSetFilter, getFreeSetIds } from './middleware/auth.js'
@@ -681,38 +682,47 @@ export function createApp(db: Database) {
     res.json(predictGradientBoost(db, String(req.params.cardId)))
   })
 
-  app.get('/api/models/random-forest/feature-importance', ...premiumAuth, cachedJson(1_800_000, () => computeFeatureImportance(db)))
+  app.get('/api/models/random-forest/feature-importance', ...premiumAuth, cachedJson(1_800_000, () => {
+    return loadModelResult(db, 'feature-importance') ?? computeFeatureImportance(db)
+  }))
 
   app.get('/api/models/momentum/cards', ...premiumAuth, cachedJson(1_800_000, (req) => {
-    const all = detectMomentumCards(db)
+    const stored = loadModelResult(db, 'momentum') as { items: unknown[]; total: number } | null
+    const all = stored ? stored.items : detectMomentumCards(db)
     const limit = clampInt(req.query.limit, 1, 100, 15)
-    const offset = clampInt(req.query.offset, 0, all.length, 0)
-    return { items: all.slice(offset, offset + limit), total: all.length }
+    const offset = clampInt(req.query.offset, 0, (all as unknown[]).length, 0)
+    return { items: (all as unknown[]).slice(offset, offset + limit), total: (all as unknown[]).length }
   }))
 
   app.get('/api/models/momentum/:cardId', ...premiumAuth, (req, res) => {
     res.json(getCardMomentum(db, String(req.params.cardId)))
   })
 
-  app.get('/api/models/sentiment/top-positive', ...premiumAuth, cachedJson(1_800_000, () => getTopSentiment(db, 'positive')))
-  app.get('/api/models/sentiment/top-negative', ...premiumAuth, cachedJson(1_800_000, () => getTopSentiment(db, 'negative')))
+  app.get('/api/models/sentiment/top-positive', ...premiumAuth, cachedJson(1_800_000, () => {
+    return loadModelResult(db, 'sentiment-positive') ?? getTopSentiment(db, 'positive')
+  }))
+  app.get('/api/models/sentiment/top-negative', ...premiumAuth, cachedJson(1_800_000, () => {
+    return loadModelResult(db, 'sentiment-negative') ?? getTopSentiment(db, 'negative')
+  }))
 
   app.get('/api/models/sentiment/:cardId', ...premiumAuth, (req, res) => {
     res.json(analyzeCardSentiment(db, String(req.params.cardId)))
   })
 
   app.get('/api/models/supply-shock/alerts', ...premiumAuth, cachedJson(1_800_000, (req) => {
-    const all = detectSupplyShocks(db)
+    const stored = loadModelResult(db, 'supply-shock') as { items: unknown[]; total: number } | null
+    const all = stored ? stored.items : detectSupplyShocks(db)
     const limit = clampInt(req.query.limit, 1, 100, 30)
-    const offset = clampInt(req.query.offset, 0, all.length, 0)
-    return { items: all.slice(offset, offset + limit), total: all.length }
+    const offset = clampInt(req.query.offset, 0, (all as unknown[]).length, 0)
+    return { items: (all as unknown[]).slice(offset, offset + limit), total: (all as unknown[]).length }
   }))
 
   app.get('/api/models/anomalies/recent', ...premiumAuth, cachedJson(1_800_000, (req) => {
-    const all = detectAnomalies(db, { days: 30 })
+    const stored = loadModelResult(db, 'anomaly') as { items: unknown[]; total: number } | null
+    const all = stored ? stored.items : detectAnomalies(db, { days: 30 })
     const limit = clampInt(req.query.limit, 1, 100, 30)
-    const offset = clampInt(req.query.offset, 0, all.length, 0)
-    return { items: all.slice(offset, offset + limit), total: all.length }
+    const offset = clampInt(req.query.offset, 0, (all as unknown[]).length, 0)
+    return { items: (all as unknown[]).slice(offset, offset + limit), total: (all as unknown[]).length }
   }))
 
   app.get('/api/models/anomalies/:cardId', ...premiumAuth, (req, res) => {
@@ -720,10 +730,11 @@ export function createApp(db: Database) {
   })
 
   app.get('/api/models/cointegration/pairs', ...premiumAuth, cachedJson(1_800_000, (req) => {
-    const all = findCointegrationPairs(db)
+    const stored = loadModelResult(db, 'cointegration') as { items: unknown[]; total: number } | null
+    const all = stored ? stored.items : findCointegrationPairs(db)
     const limit = clampInt(req.query.limit, 1, 100, 20)
-    const offset = clampInt(req.query.offset, 0, all.length, 0)
-    return { items: all.slice(offset, offset + limit), total: all.length }
+    const offset = clampInt(req.query.offset, 0, (all as unknown[]).length, 0)
+    return { items: (all as unknown[]).slice(offset, offset + limit), total: (all as unknown[]).length }
   }))
 
   app.get('/api/models/cointegration/:cardId', ...premiumAuth, (req, res) => {
@@ -735,6 +746,8 @@ export function createApp(db: Database) {
   })
 
   app.get('/api/models/clusters/all', ...premiumAuth, cachedJson(1_800_000, () => {
+    const stored = loadModelResult(db, 'clustering') as { profiles: unknown[] } | null
+    if (stored) return stored
     const { profiles } = runClustering(db)
     return { profiles }
   }))
@@ -743,7 +756,9 @@ export function createApp(db: Database) {
     res.json(getCardCluster(db, String(req.params.cardId)))
   })
 
-  app.get('/api/models/pca/components', ...premiumAuth, cachedJson(1_800_000, () => computePCA(db)))
+  app.get('/api/models/pca/components', ...premiumAuth, cachedJson(1_800_000, () => {
+    return loadModelResult(db, 'pca') ?? computePCA(db)
+  }))
 
   app.get('/api/models/status', ...premiumAuth, (_req, res) => {
     const cacheKey = 'GET:/api/models/status'

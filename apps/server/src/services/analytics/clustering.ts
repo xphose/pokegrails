@@ -84,39 +84,45 @@ function kMeans(
     centroids.push([...data[idx]])
   }
 
-  let assignments = new Array(n).fill(0)
+  const assignments = new Int32Array(n)
+  const clusterCounts = new Int32Array(k)
+  const centroidSums = new Float64Array(k * dim)
 
   for (let iter = 0; iter < maxIter; iter++) {
-    const newAssign = new Array(n).fill(0)
+    let changed = false
     for (let i = 0; i < n; i++) {
       let bestDist = Infinity
+      let bestC = 0
       for (let c = 0; c < k; c++) {
         let dist = 0
         for (let d = 0; d < dim; d++) dist += (data[i][d] - centroids[c][d]) ** 2
         if (dist < bestDist) {
           bestDist = dist
-          newAssign[i] = c
+          bestC = c
         }
       }
+      if (bestC !== assignments[i]) changed = true
+      assignments[i] = bestC
     }
 
-    let changed = false
-    for (let i = 0; i < n; i++) {
-      if (newAssign[i] !== assignments[i]) changed = true
-    }
-    assignments = newAssign
     if (!changed) break
 
+    clusterCounts.fill(0)
+    centroidSums.fill(0)
+    for (let i = 0; i < n; i++) {
+      const c = assignments[i]
+      clusterCounts[c]++
+      const base = c * dim
+      for (let d = 0; d < dim; d++) centroidSums[base + d] += data[i][d]
+    }
     for (let c = 0; c < k; c++) {
-      const members = data.filter((_, i) => assignments[i] === c)
-      if (members.length === 0) continue
-      for (let d = 0; d < dim; d++) {
-        centroids[c][d] = mean(members.map(m => m[d]))
-      }
+      if (clusterCounts[c] === 0) continue
+      const base = c * dim
+      for (let d = 0; d < dim; d++) centroids[c][d] = centroidSums[base + d] / clusterCounts[c]
     }
   }
 
-  return { assignments, centroids }
+  return { assignments: Array.from(assignments), centroids }
 }
 
 function silhouetteScore(data: number[][], assignments: number[], k: number): number {

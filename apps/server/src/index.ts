@@ -6,7 +6,7 @@ import { config } from './config.js'
 import { getDb } from './db/connection.js'
 import { createApp } from './app.js'
 import { configureWebPush } from './services/push.js'
-import { fullRefresh, startCronJobs, setRefreshing } from './services/cron.js'
+import { fullRefresh, startCronJobs, setRefreshing, hydrateFromDb } from './services/cron.js'
 import { seedUpcomingSets } from './services/upcoming.js'
 import { seedMissingPriceHistory } from './services/priceHistory.js'
 
@@ -15,6 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const db = getDb()
 configureWebPush()
 seedUpcomingSets(db)
+hydrateFromDb(db)
 startCronJobs(db)
 
 setImmediate(async () => {
