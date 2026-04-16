@@ -10,6 +10,12 @@ import { refreshSetMetrics } from './setMetrics.js'
 import { notifyPriceAlerts } from './push.js'
 import { refreshSealedPrices, seedSealedPrices } from './sealedPrices.js'
 import { takePredictionSnapshot } from './trackRecord.js'
+import { trainGradientBoostModel } from './analytics/gradientBoost.js'
+import { computeFeatureImportance } from './analytics/featureImportance.js'
+import { detectMomentumCards } from './analytics/momentum.js'
+import { detectSupplyShocks } from './analytics/supplyShock.js'
+import { detectAnomalies } from './analytics/anomaly.js'
+import { findCointegrationPairs } from './analytics/cointegration.js'
 
 let refreshing = false
 export function setRefreshing(v: boolean) { refreshing = v }
@@ -42,6 +48,20 @@ export function startCronJobs(db: Database.Database) {
   cron.schedule('0 */12 * * *', safe('sealed', async () => { await refreshSealedPrices(db) }))
 }
 
+function runAnalyticsModels(db: Database.Database) {
+  const models: [string, () => void][] = [
+    ['gradient-boost', () => { trainGradientBoostModel(db) }],
+    ['feature-importance', () => { computeFeatureImportance(db) }],
+    ['momentum', () => { detectMomentumCards(db) }],
+    ['supply-shock', () => { detectSupplyShocks(db) }],
+    ['anomaly', () => { detectAnomalies(db, { days: 30 }) }],
+    ['cointegration', () => { findCointegrationPairs(db) }],
+  ]
+  for (const [name, run] of models) {
+    try { run() } catch (e) { console.error(`[analytics] ${name}:`, e) }
+  }
+}
+
 export async function fullRefresh(db: Database.Database) {
   seedSealedPrices(db)
   await ingestPokemonTcg(db)
@@ -50,4 +70,5 @@ export async function fullRefresh(db: Database.Database) {
   takePredictionSnapshot(db)
   await refreshSealedPrices(db).catch(() => {})
   refreshSetMetrics(db)
+  runAnalyticsModels(db)
 }

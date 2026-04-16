@@ -18,3 +18,30 @@
 		}
 	}
 }
+
+dev.pokegrails.com {
+	@notapi not path /api/*
+	basicauth @notapi {
+		# Generate hash: docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpassword'
+		# dev YOUR_BCRYPT_HASH_HERE
+	}
+
+	encode gzip zstd
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	reverse_proxy pokegrails-dev:3001
+
+	log {
+		output file /data/dev-access.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}

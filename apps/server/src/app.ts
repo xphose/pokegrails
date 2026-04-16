@@ -668,7 +668,7 @@ export function createApp(db: Database) {
     res.json(result)
   })
 
-  app.post('/api/models/gradient-boost/train', ...premiumAuth, (_req, res) => {
+  app.post('/api/models/gradient-boost/train', authenticate, requireAdmin, (_req, res) => {
     try {
       const model = trainGradientBoostModel(db)
       res.json({ ok: true, trained_at: model.trainedAt, features: model.featureLabels.length })
