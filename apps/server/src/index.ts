@@ -29,20 +29,31 @@ const workerId = process.env.NODE_APP_INSTANCE
 const isPrimary = workerId === undefined || workerId === '0'
 
 if (isPrimary) {
-  console.log(`[primary] worker=${workerId ?? 'fork'} — enabling cron jobs + initial ingest`)
+  console.log(`[primary] worker=${workerId ?? 'fork'} — enabling cron jobs`)
   startCronJobs(db)
 
-  setImmediate(async () => {
-    setRefreshing(true)
-    try {
-      await dataRefresh(db)
-    } catch (e) {
-      console.error('Initial ingest failed', e)
-    } finally {
-      setRefreshing(false)
-    }
-    seedMissingPriceHistory(db)
-  })
+  // Only run the full ingest on a truly cold DB. Otherwise PM2's
+  // max_memory_restart on the primary worker turns into a restart loop: ingest
+  // grows memory past the cap, PM2 kills the worker, a new worker starts and
+  // kicks off another ingest, and so on. The 4-hour cron still refreshes
+  // prices, so on warm DBs we let that handle it.
+  const cardCount = (db.prepare('SELECT COUNT(*) AS c FROM cards').get() as { c: number } | undefined)?.c ?? 0
+  if (cardCount === 0) {
+    console.log('[primary] cold DB detected — running initial ingest')
+    setImmediate(async () => {
+      setRefreshing(true)
+      try {
+        await dataRefresh(db)
+      } catch (e) {
+        console.error('Initial ingest failed', e)
+      } finally {
+        setRefreshing(false)
+      }
+      seedMissingPriceHistory(db)
+    })
+  } else {
+    console.log(`[primary] warm DB (${cardCount} cards) — skipping initial ingest; cron will refresh`)
+  }
 } else {
   console.log(`[worker ${workerId}] HTTP-only — cron jobs + ingest handled by worker 0`)
 }
