@@ -1,0 +1,16 @@
+[Unit]
+Description=Run Sentinel watchdog every 2 minutes
+Documentation=https://github.com/pokegrails/pokegrails/tree/main/ops/sentinel
+
+[Timer]
+# Fire 30s after boot so the stack has a chance to come up, then every 2 min.
+OnBootSec=30s
+OnUnitActiveSec=2min
+# If the system was off when we should have fired, run once on resume
+Persistent=true
+# Prevent long jitter; keep cadence tight
+AccuracySec=5s
+Unit=sentinel.service
+
+[Install]
+WantedBy=timers.target

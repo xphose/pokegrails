@@ -1,0 +1,39 @@
+[Unit]
+Description=Sentinel — PokeGrails host watchdog (one-shot)
+Documentation=https://github.com/pokegrails/pokegrails/tree/main/ops/sentinel
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Non-root, but the user must be in the `docker` group so `docker inspect`
+# works without sudo. The installer handles this.
+User=sentinel
+Group=sentinel
+SupplementaryGroups=docker
+EnvironmentFile=-/etc/sentinel/config.env
+ExecStart=/opt/sentinel/sentinel.sh
+
+# Harden the service — it only needs to read docker state and reach the net
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sentinel /var/log/sentinel
+# dmesg needs CAP_SYSLOG on most distros; granted narrowly here
+AmbientCapabilities=CAP_SYSLOG
+CapabilityBoundingSet=CAP_SYSLOG
+RestrictNamespaces=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+SystemCallArchitectures=native
+
+# Don't let a stuck run pile up
+TimeoutStartSec=90
+
+# Journald captures stdout/stderr so `journalctl -u sentinel` shows the log
+StandardOutput=journal
+StandardError=journal
