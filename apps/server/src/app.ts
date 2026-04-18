@@ -2,6 +2,7 @@ import cors from 'cors'
 import express from 'express'
 import helmet from 'helmet'
 import compression from 'compression'
+import cookieParser from 'cookie-parser'
 import rateLimit from 'express-rate-limit'
 import type { Database } from 'better-sqlite3'
 import { config } from './config.js'
@@ -60,6 +61,10 @@ export function createApp(db: Database) {
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   }))
+  // Refresh tokens live in an httpOnly cookie so a successful XSS can't
+  // exfiltrate them (the access token is short-lived and stays in JS).
+  // cookie-parser populates req.cookies for the /api/auth/refresh handler.
+  app.use(cookieParser())
 
   // Global API limiter. 300/15min was way too tight for an SPA that fires
   // 20-40 parallel requests per page load (Cards tab alone: list + filters +
@@ -923,7 +928,14 @@ export function createApp(db: Database) {
   //     ?limit=500                                     — top-N by market_price
   //     ?skipSealed=1                                  — skip Phase 4 on full run
   app.post('/api/internal/backfill-pricecharting', authenticate, requireAdmin, async (req, res) => {
-    const { runPricechartingBackfill } = await import('./services/pricechartingBackfill.js')
+    const { runPricechartingBackfill, isBackfillRunning } = await import('./services/pricechartingBackfill.js')
+    if (isBackfillRunning()) {
+      res.status(409).json({
+        ok: false,
+        error: 'A backfill is already running on this node. Wait for it to finish or check status.',
+      })
+      return
+    }
     const opts: {
       force?: boolean
       cardId?: string
@@ -942,7 +954,7 @@ export function createApp(db: Database) {
     }
     res.json({
       ok: true,
-      message: `Backfill started in background — watch server console`,
+      message: `Backfill started in background — watch server console or /api/internal/backfill-pricecharting/status`,
       opts,
     })
     try {
@@ -952,6 +964,25 @@ export function createApp(db: Database) {
       console.error('[backfill] Failed:', e)
     }
   })
+
+  // Read-only status of the backfill — durable counts from the DB plus
+  // in-memory progress from any currently-running job on this node. The
+  // admin dashboard polls this every ~10s to show a progress bar without
+  // touching the orchestrator itself.
+  app.get(
+    '/api/internal/backfill-pricecharting/status',
+    authenticate,
+    requireAdmin,
+    async (_req, res) => {
+      try {
+        const { getBackfillStatus } = await import('./services/pricechartingBackfill.js')
+        const status = getBackfillStatus(db)
+        res.json({ ok: true, status })
+      } catch (e) {
+        res.status(500).json({ ok: false, error: String(e) })
+      }
+    },
+  )
 
   app.post('/api/internal/refresh-sealed', authenticate, requireAdmin, async (_req, res) => {
     try {
@@ -976,6 +1007,59 @@ export function createApp(db: Database) {
       const result = scrubPriceHistory(db, { cardId, verbose })
       cacheInvalidateAll()
       res.json({ ok: true, ...result })
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) })
+    }
+  })
+
+  // Catalog-wide price-history audit. See services/priceHistoryAudit.ts
+  // for the full rationale. Mirrors the display filter's anchor + band
+  // logic so the numbers it reports match what a real user would see on
+  // the card chart. Read-only by default; pass `fix=1` to auto-scrub
+  // every offender in one pass (serial, not parallel — the scrub holds
+  // SQLite write locks). Pagination is via `threshold` and `limit` —
+  // only `offenders` is capped, the summary counts are always complete.
+  app.get('/api/internal/price-history-audit', authenticate, requireAdmin, async (req, res) => {
+    try {
+      const { auditPriceHistory } = await import('./services/priceHistoryAudit.js')
+      const threshold = Number(req.query.threshold) || undefined
+      const limit = Number(req.query.limit) || undefined
+      const cardId = typeof req.query.cardId === 'string' ? req.query.cardId : undefined
+      const fix = req.query.fix === '1' || req.query.fix === 'true'
+      const result = auditPriceHistory(db, {
+        thresholdRatio: threshold,
+        maxOffenders: limit,
+        cardId,
+      })
+      if (!fix || result.offenders.length === 0) {
+        return res.json({ ok: true, ...result, fixed: null })
+      }
+      const { scrubPriceHistory } = await import('./services/priceHistoryScrub.js')
+      let deleted = 0
+      let winsorized = 0
+      let modified = 0
+      for (const o of result.offenders) {
+        const s = scrubPriceHistory(db, { cardId: o.card_id })
+        deleted += s.rowsDeleted
+        winsorized += s.rowsWinsorized
+        if (s.rowsDeleted + s.rowsWinsorized > 0) modified++
+      }
+      cacheInvalidateAll()
+      const after = auditPriceHistory(db, {
+        thresholdRatio: threshold,
+        maxOffenders: 0,
+        cardId,
+      })
+      res.json({
+        ok: true,
+        ...result,
+        fixed: {
+          cards_modified: modified,
+          rows_deleted: deleted,
+          rows_winsorized: winsorized,
+          offenders_remaining: after.summary.offenders,
+        },
+      })
     } catch (e) {
       res.status(500).json({ ok: false, error: String(e) })
     }

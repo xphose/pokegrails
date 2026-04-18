@@ -29,6 +29,8 @@ import {
 import { cn } from '@/lib/utils'
 import { buildSocialMomentumRows } from '@/lib/social-momentum'
 import { HelpButton } from '@/components/help-center'
+import { AdminBackfillPanel } from '@/components/AdminBackfillPanel'
+import { useAuth } from '@/lib/auth'
 
 type DashKpis = {
   totalCards: number
@@ -382,6 +384,7 @@ function matchesValuation(c: CardRow, v: DashboardPrefs['valuation']): boolean {
 
 export function Dashboard() {
   const queryClient = useQueryClient()
+  const { isAdmin } = useAuth()
   const [fullRefreshBusy, setFullRefreshBusy] = useState(false)
   const [fullRefreshMsg, setFullRefreshMsg] = useState<string | null>(null)
 
@@ -754,6 +757,8 @@ export function Dashboard() {
           {fullRefreshMsg}
         </p>
       )}
+
+      {isAdmin && <AdminBackfillPanel />}
 
       <nav className="flex flex-wrap gap-2" aria-label="Quick navigation">
         {(

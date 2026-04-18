@@ -13,12 +13,53 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 function generateTokens(payload: JwtPayload) {
   const accessToken = jwt.sign(payload, config.jwtSecret, { expiresIn: config.jwtExpiresIn as StringValue })
-  const refreshToken = jwt.sign({ userId: payload.userId, type: 'refresh' }, config.jwtRefreshSecret, { expiresIn: config.jwtRefreshExpiresIn as StringValue })
+  // `jti` (JWT ID) makes the refresh token unique even when the same
+  // user rotates twice in the same second. Without it two back-to-back
+  // refreshes produce byte-identical tokens — the DB hash matches, the
+  // "new" row is the old row, and a stolen token can be replayed
+  // indefinitely. With a random jti, each refresh produces a fresh
+  // hash, so the old row really is gone after rotation.
+  const refreshToken = jwt.sign(
+    { userId: payload.userId, type: 'refresh', jti: crypto.randomBytes(16).toString('hex') },
+    config.jwtRefreshSecret,
+    { expiresIn: config.jwtRefreshExpiresIn as StringValue },
+  )
   return { accessToken, refreshToken }
 }
 
 function hashRefreshToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex')
+}
+
+/**
+ * Name of the httpOnly cookie the browser uses for refresh-token
+ * rotation. Kept narrowly scoped to `/api/auth` so it isn't sent on
+ * every single request, only on the three endpoints that read it.
+ */
+export const REFRESH_COOKIE_NAME = 'pg_refresh'
+export const REFRESH_COOKIE_PATH = '/api/auth'
+const REFRESH_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * Set the refresh token in an httpOnly cookie. We use SameSite=Lax so
+ * top-level form submissions still work (login redirect pages etc.),
+ * but cross-origin POSTs — the actual CSRF vector — are blocked. The
+ * cookie never leaves the `/api/auth` path so it doesn't bloat
+ * unrelated requests. `secure` is on in prod (where HTTPS is
+ * required); off in local dev so http://localhost:5173 works.
+ */
+function setRefreshCookie(res: Response, refreshToken: string): void {
+  res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
+    httpOnly: true,
+    secure: config.nodeEnv === 'production',
+    sameSite: 'lax',
+    path: REFRESH_COOKIE_PATH,
+    maxAge: REFRESH_COOKIE_MAX_AGE_MS,
+  })
+}
+
+function clearRefreshCookie(res: Response): void {
+  res.clearCookie(REFRESH_COOKIE_NAME, { path: REFRESH_COOKIE_PATH })
 }
 
 type LoginFailureReason = 'no-user' | 'bad-password' | 'exception'
@@ -86,9 +127,13 @@ export function authRoutes(db: Database): Router {
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
       db.prepare('INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)').run(userId, tokenHash, expiresAt)
 
+      setRefreshCookie(res, refreshToken)
       res.status(201).json({
         user: { id: Number(userId), username, email: normalizedEmail, role },
         accessToken,
+        // Body copy kept during the deprecation window so clients that
+        // still read the refresh token from the response (localStorage-
+        // based flow) keep working. New clients ignore this field.
         refreshToken,
       })
     } catch (e) {
@@ -144,6 +189,7 @@ export function authRoutes(db: Database): Router {
       db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').run(user.id)
       db.prepare('INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)').run(user.id, tokenHash, expiresAt)
 
+      setRefreshCookie(res, refreshToken)
       res.json({
         user: { id: user.id, username: user.username, email: user.email, role: user.role },
         accessToken,
@@ -157,8 +203,20 @@ export function authRoutes(db: Database): Router {
 
   router.post('/refresh', (req: Request, res: Response) => {
     try {
-      const { refreshToken: token } = req.body as { refreshToken?: string }
+      // Cookie is the preferred source. Body is honored for legacy
+      // clients that still send their refresh token in JSON — once
+      // they call /refresh once, the server sets a cookie and the
+      // next rotation uses it, after which the client can discard
+      // the localStorage copy.
+      const cookieToken = (req.cookies as Record<string, unknown> | undefined)?.[REFRESH_COOKIE_NAME]
+      const bodyToken = (req.body as { refreshToken?: string } | undefined)?.refreshToken
+      const token = typeof cookieToken === 'string' && cookieToken.length > 0
+        ? cookieToken
+        : typeof bodyToken === 'string' && bodyToken.length > 0
+          ? bodyToken
+          : undefined
       if (!token) {
+        clearRefreshCookie(res)
         res.status(400).json({ error: 'refreshToken is required' })
         return
       }
@@ -167,11 +225,13 @@ export function authRoutes(db: Database): Router {
       try {
         decoded = jwt.verify(token, config.jwtRefreshSecret) as any
       } catch {
+        clearRefreshCookie(res)
         res.status(401).json({ error: 'Invalid or expired refresh token' })
         return
       }
 
       if (decoded.type !== 'refresh') {
+        clearRefreshCookie(res)
         res.status(401).json({ error: 'Invalid token type' })
         return
       }
@@ -182,12 +242,14 @@ export function authRoutes(db: Database): Router {
       ).get(tokenHash) as { id: number; user_id: number } | undefined
 
       if (!stored) {
+        clearRefreshCookie(res)
         res.status(401).json({ error: 'Refresh token not found or expired' })
         return
       }
 
       const user = db.prepare('SELECT id, username, role FROM users WHERE id = ?').get(stored.user_id) as { id: number; username: string; role: string } | undefined
       if (!user) {
+        clearRefreshCookie(res)
         res.status(401).json({ error: 'User not found' })
         return
       }
@@ -200,6 +262,9 @@ export function authRoutes(db: Database): Router {
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
       db.prepare('INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)').run(user.id, newHash, expiresAt)
 
+      // Rotate the cookie even if the caller used the body path so the
+      // next refresh can proceed without the body token.
+      setRefreshCookie(res, tokens.refreshToken)
       res.json({ accessToken: tokens.accessToken, refreshToken: tokens.refreshToken })
     } catch (e) {
       console.error('[auth] Refresh error:', e)
@@ -272,6 +337,7 @@ export function authRoutes(db: Database): Router {
       db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').run(user.id)
       db.prepare('INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)').run(user.id, tokenHash, expiresAt)
 
+      setRefreshCookie(res, refreshToken)
       res.json({
         user: { id: user.id, username: user.username, email: user.email, role: user.role },
         accessToken,
@@ -294,6 +360,7 @@ export function authRoutes(db: Database): Router {
 
   router.post('/logout', authenticate, (req: Request, res: Response) => {
     db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').run(req.user!.userId)
+    clearRefreshCookie(res)
     res.json({ ok: true })
   })
 

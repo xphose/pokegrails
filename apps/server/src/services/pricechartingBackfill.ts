@@ -311,6 +311,138 @@ export interface BackfillStats {
   gradeHistoryRows?: number
 }
 
+/**
+ * Live progress state for an in-flight backfill. Lives in module scope
+ * because the backfill runs in-process and a single node serves the
+ * admin UI (there's no need for Redis/IPC). If we ever go multi-node
+ * this becomes a "latest run on node X" report; the durable counts in
+ * `getBackfillStatus` are always read from the DB.
+ */
+interface BackfillProgress {
+  running: boolean
+  phase: 'idle' | 'phase1-match' | 'phase2-meta' | 'phase3-chart' | 'phase4-sealed' | 'complete' | 'failed'
+  currentIndex: number
+  currentTotal: number
+  startedAt: number | null
+  finishedAt: number | null
+  lastError: string | null
+  lastStats: BackfillStats | null
+  scope: string
+}
+
+const progress: BackfillProgress = {
+  running: false,
+  phase: 'idle',
+  currentIndex: 0,
+  currentTotal: 0,
+  startedAt: null,
+  finishedAt: null,
+  lastError: null,
+  lastStats: null,
+  scope: 'none',
+}
+
+function setPhase(phase: BackfillProgress['phase'], total = 0): void {
+  progress.phase = phase
+  progress.currentIndex = 0
+  progress.currentTotal = total
+}
+function tickProgress(index: number): void {
+  progress.currentIndex = index
+}
+
+export interface BackfillStatus {
+  /** True while a backfill is in-flight in this process. */
+  running: boolean
+  /** Coarse phase label that maps to what the job is doing right now. */
+  phase: BackfillProgress['phase']
+  /** `{ current: i, total: N }` for the current phase (monotonic within a phase). */
+  phaseProgress: { current: number; total: number }
+  /** Epoch ms when the last run started, or null if one has never started. */
+  startedAt: number | null
+  /** Epoch ms when the last run finished, or null if it's still running. */
+  finishedAt: number | null
+  /** Last fatal error message, if any. */
+  lastError: string | null
+  /** Last completed run's stats (survives until the next run starts). */
+  lastStats: BackfillStats | null
+  /** Scope label of the last run (`all`, `setId=sv4pt5`, etc). */
+  scope: string
+  /** DB-backed durable counts. These are ALWAYS fresh (not cached). */
+  durable: {
+    cardsTotal: number
+    cardsMatched: number
+    cardsUnmatched: number
+    cardsWithHistory: number
+    /** `matched / total` as a 0..1 fraction. */
+    percentMatched: number
+    /** `withHistory / matched` as a 0..1 fraction. */
+    percentScraped: number
+    /** Total rows in price_history with a PC source. */
+    pcHistoryRows: number
+    /** Most recent PC history timestamp — tells operators if data is fresh. */
+    latestPcTimestamp: string | null
+  }
+}
+
+/**
+ * Pure read — no side effects. Safe to call from any admin route.
+ *
+ * "Durable" counts come from the DB (so they're correct across restarts
+ * and multi-node deployments). The `running` / `phase` fields come from
+ * in-memory state and reflect the CURRENT node's in-flight job only.
+ */
+export function getBackfillStatus(db: Database.Database): BackfillStatus {
+  const cardsTotal = (db.prepare(`SELECT COUNT(*) AS c FROM cards`).get() as { c: number }).c
+  const cardsMatched = (
+    db.prepare(`SELECT COUNT(*) AS c FROM cards WHERE pricecharting_id IS NOT NULL`).get() as { c: number }
+  ).c
+  const cardsUnmatched = cardsTotal - cardsMatched
+  const cardsWithHistory = (
+    db
+      .prepare(
+        `SELECT COUNT(DISTINCT card_id) AS c FROM price_history WHERE pricecharting_median IS NOT NULL`,
+      )
+      .get() as { c: number }
+  ).c
+  const pcHistoryRows = (
+    db
+      .prepare(`SELECT COUNT(*) AS c FROM price_history WHERE pricecharting_median IS NOT NULL`)
+      .get() as { c: number }
+  ).c
+  const latestRow = db
+    .prepare(
+      `SELECT MAX(timestamp) AS ts FROM price_history WHERE pricecharting_median IS NOT NULL`,
+    )
+    .get() as { ts: string | null } | undefined
+
+  return {
+    running: progress.running,
+    phase: progress.phase,
+    phaseProgress: { current: progress.currentIndex, total: progress.currentTotal },
+    startedAt: progress.startedAt,
+    finishedAt: progress.finishedAt,
+    lastError: progress.lastError,
+    lastStats: progress.lastStats,
+    scope: progress.scope,
+    durable: {
+      cardsTotal,
+      cardsMatched,
+      cardsUnmatched,
+      cardsWithHistory,
+      percentMatched: cardsTotal > 0 ? cardsMatched / cardsTotal : 0,
+      percentScraped: cardsMatched > 0 ? cardsWithHistory / cardsMatched : 0,
+      pcHistoryRows,
+      latestPcTimestamp: latestRow?.ts ?? null,
+    },
+  }
+}
+
+/** Returns true if a backfill is currently running in this process. */
+export function isBackfillRunning(): boolean {
+  return progress.running
+}
+
 export interface BackfillOptions {
   /** Re-scrape even if we already have ≥6 PC rows. Default false. */
   force?: boolean
@@ -334,6 +466,45 @@ export async function runPricechartingBackfill(
     return { cardsMatched: 0, cardsScraped: 0, sealedScraped: 0, errors: 0 }
   }
 
+  // Concurrency guard — a second caller returns the empty stats rather
+  // than kicking off a parallel scrape. The admin UI relies on this so
+  // a double-click can't produce two overlapping jobs.
+  if (progress.running) {
+    console.log('[pc-backfill] already running — refusing to start a second instance')
+    return { cardsMatched: 0, cardsScraped: 0, sealedScraped: 0, errors: 0 }
+  }
+
+  progress.running = true
+  progress.phase = 'phase1-match'
+  progress.startedAt = Date.now()
+  progress.finishedAt = null
+  progress.lastError = null
+  progress.scope = opts.cardId
+    ? `cardId=${opts.cardId}`
+    : opts.setId
+      ? `setId=${opts.setId}`
+      : 'ALL'
+
+  try {
+    const stats = await runPricechartingBackfillInner(db, opts, token)
+    progress.phase = 'complete'
+    progress.lastStats = stats
+    return stats
+  } catch (e) {
+    progress.phase = 'failed'
+    progress.lastError = String(e)
+    throw e
+  } finally {
+    progress.running = false
+    progress.finishedAt = Date.now()
+  }
+}
+
+async function runPricechartingBackfillInner(
+  db: Database.Database,
+  opts: BackfillOptions,
+  token: string,
+): Promise<BackfillStats> {
   console.log('[pc-backfill] ═══════════════════════════════════════')
   console.log('[pc-backfill] PriceCharting Historical Backfill START')
   console.log(
@@ -384,9 +555,11 @@ export async function runPricechartingBackfill(
   let alreadyMatched = 0
 
   console.log(`[pc-backfill] Phase 1: Matching ${cards.length} cards to PriceCharting...`)
+  setPhase('phase1-match', cards.length)
 
   for (let i = 0; i < cards.length; i++) {
     const card = cards[i]
+    tickProgress(i + 1)
 
     if (card.pricecharting_id) {
       alreadyMatched++
@@ -425,8 +598,10 @@ export async function runPricechartingBackfill(
 
   if (needsMeta.length > 0) {
     console.log(`[pc-backfill] Phase 2a: Fetching metadata for ${needsMeta.length} previously-matched cards...`)
+    setPhase('phase2-meta', needsMeta.length)
     for (let i = 0; i < needsMeta.length; i++) {
       const card = needsMeta[i]
+      tickProgress(i + 1)
       try {
         const meta = await fetchPcMeta(token, card.pricecharting_id!)
         if (meta) {
@@ -454,9 +629,11 @@ export async function runPricechartingBackfill(
   const cardsWithMeta = cards.filter((c) => c.pricecharting_id && pcMeta.has(c.id))
 
   console.log(`[pc-backfill] Phase 3: Scraping charts for ${cardsWithMeta.length} cards...`)
+  setPhase('phase3-chart', cardsWithMeta.length)
 
   for (let i = 0; i < cardsWithMeta.length; i++) {
     const card = cardsWithMeta[i]
+    tickProgress(i + 1)
     const meta = pcMeta.get(card.id)!
 
     const histCount = (hasHistStmt.get(card.id) as { c: number }).c
@@ -507,12 +684,15 @@ export async function runPricechartingBackfill(
 
   /* ── Phase 4: Sealed product historical prices ────────────── */
   console.log(`[pc-backfill] Phase 4: Scraping sealed product history...`)
+  setPhase('phase4-sealed', SEALED_CATALOG.length)
 
   const existingSealedCount = db.prepare(
     `SELECT COUNT(*) as c FROM sealed_products WHERE source = 'pricecharting-history'`,
   )
 
+  let sealedIdx = 0
   for (const entry of SEALED_CATALOG) {
+    tickProgress(++sealedIdx)
     if (!entry.pcSlug) continue
     const suffix = SEALED_SUFFIX[entry.type]
     if (!suffix) continue

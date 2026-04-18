@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { CardRow } from '@/lib/api'
 import { Dashboard } from './Dashboard'
+import { AuthProvider } from '@/lib/auth'
 
 function makeCard(overrides: Partial<CardRow>): CardRow {
   return {
@@ -88,7 +89,9 @@ function renderDashboard() {
   render(
     <QueryClientProvider client={qc}>
       <MemoryRouter>
-        <Dashboard />
+        <AuthProvider>
+          <Dashboard />
+        </AuthProvider>
       </MemoryRouter>
     </QueryClientProvider>,
   )

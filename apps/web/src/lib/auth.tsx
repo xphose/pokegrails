@@ -71,7 +71,12 @@ interface AuthContextType extends AuthState {
 const AuthContext = createContext<AuthContextType | null>(null)
 
 const ACCESS_TOKEN_KEY = 'pokegrails_access_token'
-const REFRESH_TOKEN_KEY = 'pokegrails_refresh_token'
+// Legacy key. We no longer *store* new refresh tokens here, but we read
+// any existing value once on startup so a logged-in session created
+// before this change can transparently migrate to the httpOnly cookie
+// without forcing the user to sign in again. The first successful
+// refresh clears the key.
+const LEGACY_REFRESH_TOKEN_KEY = 'pokegrails_refresh_token'
 
 function safeGetItem(key: string): string | null {
   try { return localStorage.getItem(key) } catch { return null }
@@ -89,18 +94,27 @@ export function getAccessToken(): string | null {
   return safeGetItem(ACCESS_TOKEN_KEY)
 }
 
-export function setTokens(access: string, refresh: string) {
+/**
+ * Legacy signature kept for call-site compatibility. The refresh token
+ * is now set by the server as an httpOnly cookie on every login /
+ * register / google / refresh response, so we no longer persist it in
+ * JS-visible storage (XSS-hardening). `refresh` is ignored.
+ */
+export function setTokens(access: string, _refresh?: string) {
   safeSetItem(ACCESS_TOKEN_KEY, access)
-  safeSetItem(REFRESH_TOKEN_KEY, refresh)
+  // Defense-in-depth: if a legacy refresh token is still sitting in
+  // localStorage from before this migration, wipe it now that we have
+  // a fresh access token. The cookie is authoritative going forward.
+  safeRemoveItem(LEGACY_REFRESH_TOKEN_KEY)
 }
 
 export function clearTokens() {
   safeRemoveItem(ACCESS_TOKEN_KEY)
-  safeRemoveItem(REFRESH_TOKEN_KEY)
+  safeRemoveItem(LEGACY_REFRESH_TOKEN_KEY)
 }
 
-function getRefreshToken(): string | null {
-  return safeGetItem(REFRESH_TOKEN_KEY)
+function getLegacyRefreshToken(): string | null {
+  return safeGetItem(LEGACY_REFRESH_TOKEN_KEY)
 }
 
 /**
@@ -138,26 +152,28 @@ let inflightRefresh: Promise<string | null> | null = null
 export async function refreshAccessToken(): Promise<string | null> {
   if (inflightRefresh) return inflightRefresh
   inflightRefresh = (async () => {
-    const rt = getRefreshToken()
-    if (!rt) return null
+    // Prefer the httpOnly cookie the server set on login. A legacy body
+    // token is sent exactly once — during the first refresh after this
+    // migration — to avoid forcing pre-existing sessions to re-auth.
+    const legacyRt = getLegacyRefreshToken()
     try {
       const res = await fetch('/api/auth/refresh', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken: rt }),
+        body: legacyRt ? JSON.stringify({ refreshToken: legacyRt }) : JSON.stringify({}),
       })
       if (!res.ok) {
         clearTokens()
         return null
       }
-      const data = await res.json() as { accessToken: string; refreshToken: string }
-      setTokens(data.accessToken, data.refreshToken)
+      const data = await res.json() as { accessToken: string; refreshToken?: string }
+      setTokens(data.accessToken)
       return data.accessToken
     } catch {
       clearTokens()
       return null
     } finally {
-      // allow the next refresh attempt even if this one errored
       setTimeout(() => { inflightRefresh = null }, 0)
     }
   })()
@@ -227,37 +243,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [queryClient, navigate, location.pathname])
 
   const login = async (login: string, password: string) => {
-    const data = await authApi<{ user: User; accessToken: string; refreshToken: string }>(
+    const data = await authApi<{ user: User; accessToken: string }>(
       '/api/auth/login',
       { method: 'POST', body: JSON.stringify({ login, password }) },
     )
-    setTokens(data.accessToken, data.refreshToken)
+    setTokens(data.accessToken)
     setState({ user: data.user, loading: false })
   }
 
   const register = async (username: string, email: string, password: string) => {
-    const data = await authApi<{ user: User; accessToken: string; refreshToken: string }>(
+    const data = await authApi<{ user: User; accessToken: string }>(
       '/api/auth/register',
       { method: 'POST', body: JSON.stringify({ username, email, password }) },
     )
-    setTokens(data.accessToken, data.refreshToken)
+    setTokens(data.accessToken)
     setState({ user: data.user, loading: false })
   }
 
   const loginWithGoogle = async (credential: string) => {
-    const data = await authApi<{ user: User; accessToken: string; refreshToken: string }>(
+    const data = await authApi<{ user: User; accessToken: string }>(
       '/api/auth/google',
       { method: 'POST', body: JSON.stringify({ credential }) },
     )
-    setTokens(data.accessToken, data.refreshToken)
+    setTokens(data.accessToken)
     setState({ user: data.user, loading: false })
   }
 
   const logout = () => {
     const token = getAccessToken()
     if (token) {
+      // credentials:'include' lets the server clear the refresh cookie
+      // in the response's Set-Cookie header.
       fetch('/api/auth/logout', {
         method: 'POST',
+        credentials: 'include',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       }).catch(() => {})
     }
@@ -301,17 +320,28 @@ export function useAuth(): AuthContextType {
  */
 async function authApi<T>(path: string, init?: RequestInit): Promise<T> {
   const startedWithToken = !!getAccessToken()
-  let token = await getValidAccessToken()
+  const token = await getValidAccessToken()
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (token) headers['Authorization'] = `Bearer ${token}`
 
-  let res = await fetch(path, { ...init, headers: { ...headers, ...init?.headers } })
+  // All auth routes need credentials:'include' so the httpOnly refresh
+  // cookie flows both ways (server sets it on login, browser sends it
+  // on refresh). Same-origin in prod, so this is mostly defensive.
+  let res = await fetch(path, {
+    ...init,
+    credentials: 'include',
+    headers: { ...headers, ...init?.headers },
+  })
 
   if (res.status === 401 && token) {
     const newToken = await refreshAccessToken()
     if (newToken) {
       headers['Authorization'] = `Bearer ${newToken}`
-      res = await fetch(path, { ...init, headers: { ...headers, ...init?.headers } })
+      res = await fetch(path, {
+        ...init,
+        credentials: 'include',
+        headers: { ...headers, ...init?.headers },
+      })
     } else if (startedWithToken) {
       notifySessionExpired()
       throw new SessionExpiredError()

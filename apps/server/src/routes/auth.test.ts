@@ -379,3 +379,184 @@ describe('POST /api/auth/login — rate limiting', () => {
     expect(rateLimitedBody, 'expected a 429 with a "Too many" message to distinguish from "Invalid credentials"').toBeTruthy()
   }, 30_000)
 })
+
+/* ── Cookie-based refresh tokens ──────────────────────────────── */
+
+/**
+ * Behavior contract:
+ *   1. /login, /register, /google all set a Set-Cookie with
+ *      name=pg_refresh, HttpOnly, Path=/api/auth, SameSite=Lax.
+ *   2. /refresh accepts either the cookie OR the body (during the
+ *      migration window). Cookie wins when both are present.
+ *   3. /refresh always rotates the cookie on success — after calling
+ *      it once, the next call can omit the body entirely.
+ *   4. /logout sends an expired cookie so the browser drops it.
+ *   5. Stale / invalid cookies produce 401 AND a cookie-clear header,
+ *      so the client can't silently keep sending a broken token.
+ */
+
+function pickSetCookie(res: request.Response, name: string): string | null {
+  const header = res.headers['set-cookie']
+  if (!header) return null
+  const arr = Array.isArray(header) ? header : [header]
+  return arr.find((c) => c.startsWith(`${name}=`)) ?? null
+}
+
+function extractCookieValue(setCookie: string): string | null {
+  const eq = setCookie.indexOf('=')
+  const semi = setCookie.indexOf(';')
+  if (eq < 0) return null
+  return setCookie.slice(eq + 1, semi < 0 ? setCookie.length : semi)
+}
+
+describe('Refresh tokens — httpOnly cookie issue/rotate/clear', () => {
+  beforeEach(() => cacheInvalidateAll())
+
+  it('POST /login sets an HttpOnly SameSite=Lax cookie scoped to /api/auth', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ login: 'admin@example.com', password: 'correct-horse-battery' })
+      .expect(200)
+
+    const cookie = pickSetCookie(res, 'pg_refresh')
+    expect(cookie, 'expected pg_refresh cookie on login response').toBeTruthy()
+    expect(cookie!.toLowerCase()).toContain('httponly')
+    expect(cookie!.toLowerCase()).toContain('samesite=lax')
+    expect(cookie!.toLowerCase()).toContain('path=/api/auth')
+    expect(extractCookieValue(cookie!)).toBeTruthy()
+  })
+
+  it('POST /register issues a refresh cookie', async () => {
+    const db = openMemoryDb()
+    const app = createApp(db)
+    const res = await request(app)
+      .post('/api/auth/register')
+      .send({ username: 'newone', email: 'new@example.com', password: 'correct-horse-battery' })
+      .expect(201)
+    expect(pickSetCookie(res, 'pg_refresh')).toBeTruthy()
+  })
+
+  it('POST /refresh succeeds using ONLY the cookie (no body token)', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({ login: 'admin@example.com', password: 'correct-horse-battery' })
+      .expect(200)
+    const cookie = pickSetCookie(loginRes, 'pg_refresh')!
+    const cookieValue = extractCookieValue(cookie)!
+
+    const refreshRes = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', `pg_refresh=${cookieValue}`)
+      .send({})
+      .expect(200)
+
+    expect(refreshRes.body.accessToken).toBeTruthy()
+    // Cookie is rotated on every successful refresh — the new value
+    // must differ from the one we sent, or stolen cookies could be
+    // replayed indefinitely.
+    const rotated = pickSetCookie(refreshRes, 'pg_refresh')
+    expect(rotated).toBeTruthy()
+    expect(extractCookieValue(rotated!)).not.toBe(cookieValue)
+  })
+
+  it('POST /refresh accepts a body token for legacy clients and rotates into cookie', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({ login: 'admin@example.com', password: 'correct-horse-battery' })
+      .expect(200)
+    const bodyToken: string = loginRes.body.refreshToken
+
+    // Second call: body ONLY, no cookie. This mimics a legacy client
+    // that hasn't been updated yet.
+    const refreshRes = await request(app)
+      .post('/api/auth/refresh')
+      .send({ refreshToken: bodyToken })
+      .expect(200)
+
+    expect(refreshRes.body.accessToken).toBeTruthy()
+    // The response must set a fresh cookie so subsequent refreshes
+    // can drop the body copy.
+    const rotated = pickSetCookie(refreshRes, 'pg_refresh')
+    expect(rotated, 'legacy-body refresh should still issue a cookie').toBeTruthy()
+  })
+
+  it('POST /refresh with no cookie and no body returns 400', async () => {
+    const db = openMemoryDb()
+    const app = createApp(db)
+    const res = await request(app).post('/api/auth/refresh').send({})
+    expect(res.status).toBe(400)
+  })
+
+  it('POST /refresh with an unknown token clears the cookie on the response', async () => {
+    const db = openMemoryDb()
+    const app = createApp(db)
+    const res = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', 'pg_refresh=not-a-real-token')
+      .send({})
+    expect(res.status).toBe(401)
+    const cleared = pickSetCookie(res, 'pg_refresh')
+    expect(cleared, 'server must clear the bad cookie').toBeTruthy()
+    // clearCookie expresses the clear as expires-in-the-past.
+    expect(cleared!.toLowerCase()).toMatch(/expires=thu, 01 jan 1970|max-age=0/)
+  })
+
+  it('POST /logout clears the refresh cookie', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({ login: 'admin@example.com', password: 'correct-horse-battery' })
+      .expect(200)
+    const accessToken: string = loginRes.body.accessToken
+
+    const logoutRes = await request(app)
+      .post('/api/auth/logout')
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({})
+      .expect(200)
+    const cleared = pickSetCookie(logoutRes, 'pg_refresh')
+    expect(cleared).toBeTruthy()
+    expect(cleared!.toLowerCase()).toMatch(/expires=thu, 01 jan 1970|max-age=0/)
+  })
+
+  it('reused refresh cookie (token already rotated) fails with 401', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({ login: 'admin@example.com', password: 'correct-horse-battery' })
+      .expect(200)
+    const original = extractCookieValue(pickSetCookie(loginRes, 'pg_refresh')!)!
+
+    // First refresh — rotates the token.
+    await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', `pg_refresh=${original}`)
+      .send({})
+      .expect(200)
+
+    // Replaying the original token must now fail (database row was deleted).
+    const replay = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', `pg_refresh=${original}`)
+      .send({})
+    expect(replay.status).toBe(401)
+  })
+})
