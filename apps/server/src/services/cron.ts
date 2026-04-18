@@ -10,6 +10,7 @@ import { refreshSetMetrics } from './setMetrics.js'
 import { notifyPriceAlerts } from './push.js'
 import { refreshSealedPrices } from './sealedPrices.js'
 import { runPricechartingBackfill } from './pricechartingBackfill.js'
+import { runPcCsvIngest } from './pricechartingCsv.js'
 import { scrubPriceHistory } from './priceHistoryScrub.js'
 import { takePredictionSnapshot } from './trackRecord.js'
 import { trainGradientBoostModel } from './analytics/gradientBoost.js'
@@ -55,11 +56,21 @@ export function startCronJobs(db: Database.Database) {
   cron.schedule('*/15 * * * *', safe('alerts', () => notifyPriceAlerts(db)))
   cron.schedule('0 */12 * * *', safe('sealed', async () => { await refreshSealedPrices(db) }))
 
-  // Nightly PriceCharting backfill: matches new cards, fetches point-in-time
-  // graded prices, and scrapes the full per-grade chart history into
-  // `card_grade_history`. Skips already-matched cards and cards with ≥6
-  // history points, so steady-state runs are fast.
-  cron.schedule('0 2 * * *', safe('pc-backfill', async () => {
+  // Daily bulk PriceCharting CSV pull: ONE HTTP call (~12 MB) refreshes
+  // prices for every card with a known `pricecharting_id` and appends a
+  // dated snapshot to `card_grade_history`. Runs at 02:00 UTC to dodge
+  // PC's mid-day update window. This is the steady-state path — fast,
+  // single-request, IP-rate-limit friendly.
+  cron.schedule('0 2 * * *', safe('pc-csv', async () => {
+    await runPcCsvIngest(db)
+  }))
+
+  // Weekly PriceCharting Phase 1/2/3 backfill: discovers + fuzzy-matches
+  // new cards (where the CSV's `tcg-id` doesn't help us) and scrapes the
+  // longer historical chart for new matches. Runs Sunday 03:00 UTC. The
+  // circuit breaker in pricechartingBackfill.ts auto-aborts if the prod
+  // IP gets rate-limited, so this won't make a Cloudflare ban worse.
+  cron.schedule('0 3 * * 0', safe('pc-backfill', async () => {
     await runPricechartingBackfill(db, { force: false })
   }))
 

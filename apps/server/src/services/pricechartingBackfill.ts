@@ -149,14 +149,6 @@ async function matchCard(token: string, name: string, number: string, setName?: 
 async function fetchPcMeta(token: string, pcId: string): Promise<{ consoleName: string; productName: string; gradedPrices: GradedPrices } | null> {
   const url = `${PC_BASE}/api/product?t=${token}&id=${pcId}`
   const resp = await throttledFetch(url)
-  // #region agent log (temporary — verifying Cloudflare UA fix; remove after post-fix verification)
-  if (!resp.ok) {
-    const head = (await resp.clone().text()).slice(0, 120).replace(/\s+/g, ' ')
-    console.log(`[pc-backfill][debug] fetchPcMeta ${pcId} → status=${resp.status} body[:120]="${head}"`)
-  } else {
-    console.log(`[pc-backfill][debug] fetchPcMeta ${pcId} → status=200 ok`)
-  }
-  // #endregion
   if (!resp.ok) return null
   const d = (await resp.json()) as Record<string, unknown>
   if (d.status !== 'success') return null
