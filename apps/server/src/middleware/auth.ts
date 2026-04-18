@@ -31,6 +31,15 @@ export function getFreeSetIds(db: Database): string[] {
   return freeSetIdsCache
 }
 
+/**
+ * Drop the in-memory free-set cache. Only useful in tests that seed sets
+ * across multiple describes — production's 60s TTL is fine.
+ */
+export function resetFreeSetIdsCacheForTests(): void {
+  freeSetIdsCache = null
+  freeSetIdsCacheTime = 0
+}
+
 export function isFreeUser(req: Request): boolean {
   return !req.user || req.user.role === 'free'
 }
@@ -67,16 +76,34 @@ export function authenticate(req: Request, res: Response, next: NextFunction): v
   }
 }
 
-export function optionalAuth(req: Request, _res: Response, next: NextFunction): void {
+/**
+ * Auth-optional middleware used on endpoints that behave differently for
+ * anonymous vs. authenticated users (free-tier set filters, etc.).
+ *
+ * Critical: if a Bearer token IS present but invalid/expired, we must
+ * return 401 so the client knows to refresh the access token. The previous
+ * "silently continue as anonymous" behaviour caused a very confusing bug
+ * where a 15-minute-old session would silently start returning free-tier
+ * results — search "mew" shows 2 cards instead of 20 — with no indication
+ * to the client that re-auth was needed. The only time the user knew was
+ * when they clicked "Reload Data" (which hits an admin-only route, which
+ * returns a real 401, which triggers the client's refresh flow).
+ *
+ * If no token is present at all, we pass through as anonymous. That's the
+ * genuinely "optional" path.
+ */
+export function optionalAuth(req: Request, res: Response, next: NextFunction): void {
   const header = req.headers.authorization
-  if (header?.startsWith('Bearer ')) {
-    try {
-      req.user = jwt.verify(header.slice(7), config.jwtSecret) as JwtPayload
-    } catch {
-      // token invalid, continue as unauthenticated
-    }
+  if (!header?.startsWith('Bearer ')) {
+    next()
+    return
   }
-  next()
+  try {
+    req.user = jwt.verify(header.slice(7), config.jwtSecret) as JwtPayload
+    next()
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' })
+  }
 }
 
 export function requireRole(...roles: UserRole[]) {

@@ -1,9 +1,12 @@
-import { getAccessToken, refreshAccessToken, clearTokens } from './auth'
+import { getValidAccessToken, refreshAccessToken, clearTokens } from './auth'
 
 const base = ''
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  let token = getAccessToken()
+  // getValidAccessToken() proactively refreshes when expiry is <30s away,
+  // so optionalAuth endpoints (like /api/cards) don't silently downgrade
+  // to free-tier results after 15 minutes of idle browsing.
+  let token = await getValidAccessToken()
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...init?.headers as Record<string, string> }
   if (token) headers['Authorization'] = `Bearer ${token}`
 

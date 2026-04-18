@@ -38,13 +38,18 @@ import type Database from 'better-sqlite3'
  *     regime the rest of the signals struggled with — they need PC data in
  *     the same row that often doesn't exist for legacy history.
  *
- *   Signal E — Card-level PC anchor.
+ *   Signal E — Card-level PC anchor (two-sided).
  *     `cards.pc_price_raw` is the current PriceCharting raw median for the
- *     card — a slow-moving, volume-smoothed reference. If a row's
- *     `tcgplayer_market` is > 5× that anchor and the anchor exists and is
- *     non-trivial ($5+), the row is almost certainly a data glitch. Unlike
- *     Signal A, this doesn't require PC data in the same row; it uses the
- *     point-in-time PC reference stamped on the `cards` table.
+ *     card — a slow-moving, volume-smoothed reference. Signal E fires on
+ *     BOTH sides of the anchor:
+ *       Ceiling: tcgplayer_market > 2× anchor (obvious spike contamination)
+ *       Floor:   tcgplayer_market < 0.1× anchor (the $0.01-on-a-$5-card
+ *                cents-bug ingest that was eating whole series on promos
+ *                and Pokémon Center exclusives).
+ *     Each side has a hard-cap (ceiling ≥3× / floor ≤0.01×) that promotes
+ *     a single-signal E to winsorize-sufficient when no other signal
+ *     fired — catching continuous-block contamination where MAD/spike
+ *     signals can't fire because the entire neighbourhood is bad.
  *
  * Decision policy per flagged row:
  *   - ≥3 signals fire  → delete (high confidence error).
@@ -113,6 +118,18 @@ export interface ScrubOptions {
   pcAnchorHardMultiplier?: number
   /** Signal E: minimum anchor value below which we don't trust it. */
   pcAnchorFloor?: number
+  /**
+   * Floor-side of Signal E: a row's value below anchor × this fraction
+   * fires a signal. Default 0.1 catches the "$0.01 on a $5 card" case
+   * (Pikachu VMAX, Wattrel, etc.) that was eating whole series.
+   */
+  pcAnchorFloorMultiplier?: number
+  /**
+   * Floor-side hard-cap: value below anchor × this fraction promotes the
+   * single floor signal to winsorize-sufficient. Default 0.01 — anything
+   * 100× smaller than the PC anchor is a near-certain cents-bug.
+   */
+  pcAnchorHardFloorMultiplier?: number
   windowDays?: number
   maxDeleteFraction?: number
   /**
@@ -149,6 +166,12 @@ const DEFAULTS = {
   pcAnchorMultiplier: 2,
   pcAnchorHardMultiplier: 3,
   pcAnchorFloor: 5,
+  // Floor-side of the anchor. 0.1 catches the "value is an order of
+  // magnitude below anchor" case (Pikachu VMAX: $0.01 rows on a $5 anchor
+  // card). 0.01 is the hard-cap — values 100× smaller than anchor are
+  // never legitimate card prices, they're cents-bug ingests.
+  pcAnchorFloorMultiplier: 0.1,
+  pcAnchorHardFloorMultiplier: 0.01,
   windowDays: 7,
   maxDeleteFraction: 0.25,
   // 5 passes is plenty — iteration converges monotonically and in
@@ -347,6 +370,22 @@ export function scrubPriceHistory(db: Database.Database, opts: ScrubOptions = {}
             value > cfg.pcAnchorHardMultiplier * cardAnchor!
           ) {
             signals++ // 1 → 2, winsorize
+          }
+
+          // Floor signal: cents-bug. Pikachu VMAX et al. have 197 rows at
+          // $0.01 despite a $5 PC anchor. The symmetrical failure of Signal
+          // E — value < anchor × 0.1 = "ten-cent row on a five-dollar
+          // card". Fires as a single signal plus its own hard-cap at ≤0.01×
+          // so single-witness floor outliers are winsorize-sufficient.
+          if (value < cfg.pcAnchorFloorMultiplier * cardAnchor!) {
+            signals++
+            addAnchor(cardAnchor!, 1)
+            if (
+              signalsBeforeE === 0 &&
+              value < cfg.pcAnchorHardFloorMultiplier * cardAnchor!
+            ) {
+              signals++ // 1 → 2, winsorize on a single high-confidence floor violation
+            }
           }
         }
 

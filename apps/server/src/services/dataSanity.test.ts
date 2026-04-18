@@ -36,7 +36,29 @@ const LOCAL_DB = path.resolve(
   path.join(path.dirname(new URL(import.meta.url).pathname), '..', '..', 'data', 'pokegrails.sqlite'),
 )
 
-const haveLocal = fs.existsSync(LOCAL_DB)
+// Existence alone isn't enough — previous test runs may have auto-created
+// an empty SQLite file (better-sqlite3 does that by default). We only
+// consider the snapshot "real" if it has at least the expected tables AND
+// a non-trivial row count in `cards`.
+function snapshotLooksReal(p: string): boolean {
+  try {
+    if (!fs.existsSync(p)) return false
+    const st = fs.statSync(p)
+    // Any real snapshot is hundreds of MB. An auto-created stub is 4-16 KB.
+    if (st.size < 10_000_000) return false
+    const db = new Database(p, { readonly: true, fileMustExist: true })
+    try {
+      const row = db.prepare(`SELECT COUNT(*) AS c FROM cards`).get() as { c: number }
+      return row.c > 100
+    } finally {
+      db.close()
+    }
+  } catch {
+    return false
+  }
+}
+
+const haveLocal = snapshotLooksReal(LOCAL_DB)
 const strict = process.env.POKEGRAILS_SANITY_STRICT === '1'
 
 // Max cards to sample per check. Keep low — each test hits the HTTP handler

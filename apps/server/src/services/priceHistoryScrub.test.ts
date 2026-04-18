@@ -221,6 +221,71 @@ describe('scrubPriceHistory', () => {
     expect(r.rowsWinsorized).toBe(0)
   })
 
+  // ─── Floor signal: cents-bug ────────────────────────────────────────
+  //
+  // Regression cluster from the Apr 2026 audit: Pikachu VMAX et al. had
+  // hundreds of rows at $0.01 despite a $5 PC anchor. Continuous-block
+  // contamination → MAD can't see it (all neighbours are also $0.01).
+  // Only the floor side of Signal E can save these cards.
+  describe('Signal E floor (cents-bug)', () => {
+    it('winsorizes a $0.01 row alone when anchor is $5 (hard-floor hit)', () => {
+      // $0.01 / $5 = 0.002 — below pcAnchorHardFloorMultiplier (0.01),
+      // so the single-signal E-floor is promoted to 2-signal winsorize.
+      setCardPcAnchor(db, 'test-card-1', 5)
+      const rows: Array<{ daysAgo: number; market: number; low: number }> = []
+      for (let i = 30; i >= 1; i--) rows.push({ daysAgo: i, market: 5.0, low: 4.5 })
+      rows.push({ daysAgo: 0, market: 0.01, low: 0.01 })
+      addHistory(db, 'test-card-1', rows)
+      const r = scrubPriceHistory(db)
+      expect(r.rowsWinsorized).toBeGreaterThan(0)
+      const min = db
+        .prepare(`SELECT MIN(tcgplayer_market) AS mn FROM price_history WHERE card_id='test-card-1'`)
+        .get() as { mn: number }
+      expect(min.mn).toBeGreaterThanOrEqual(5) // clamped up to anchor
+    })
+
+    it('winsorizes a continuous-block $0.01 series on a $5 anchor', () => {
+      // Pikachu VMAX shape: every row is bad. MAD blind, spike-revert
+      // blind, D blind (low = market). Only E-floor fires, but it alone
+      // must be enough (hard-floor path) — otherwise the whole series
+      // stays at $0.01.
+      setCardPcAnchor(db, 'test-card-1', 5)
+      addHistory(db, 'test-card-1',
+        Array.from({ length: 30 }, (_, i) => ({ daysAgo: 30 - i, market: 0.01, low: 0.01 })),
+      )
+      const r = scrubPriceHistory(db)
+      // Contamination is 100% of rows. Safety net should trigger for DELETE
+      // (rows would hit 3+ signals if we weren't careful), but floor signal
+      // alone maxes at 2 signals → winsorize path, which has no maxDeleteFraction
+      // cap. All rows get clamped to $5.
+      const rows = db
+        .prepare(`SELECT tcgplayer_market AS m FROM price_history WHERE card_id='test-card-1'`)
+        .all() as { m: number }[]
+      for (const row of rows) expect(row.m).toBeGreaterThanOrEqual(5)
+      expect(r.rowsWinsorized).toBe(30)
+    })
+
+    it('does not fire floor signal when anchor is below pcAnchorFloor', () => {
+      setCardPcAnchor(db, 'test-card-1', 3) // below $5 floor → unusable
+      addHistory(db, 'test-card-1', [{ daysAgo: 0, market: 0.01, low: 0.01 }])
+      const r = scrubPriceHistory(db)
+      expect(r.rowsWinsorized).toBe(0)
+      expect(r.rowsDeleted).toBe(0)
+    })
+
+    it('does not fire floor signal inside the 0.1× soft band', () => {
+      // $0.75 on a $5 anchor = 0.15× — within the soft band (0.1×–1×).
+      // No signal should fire and the row should be untouched.
+      setCardPcAnchor(db, 'test-card-1', 5)
+      addHistory(db, 'test-card-1', [
+        ...Array.from({ length: 30 }, (_, i) => ({ daysAgo: 30 - i, market: 5, low: 4.5 })),
+        { daysAgo: 0, market: 0.75, low: 0.70 }, // dip, not cents-bug
+      ])
+      const r = scrubPriceHistory(db)
+      expect(r.rowsWinsorized).toBe(0)
+    })
+  })
+
   it('narrows scope when cardId option is provided', () => {
     db.prepare(
       `INSERT INTO cards (id, name, set_id, rarity, image_url, character_name, card_type, market_price, last_updated)

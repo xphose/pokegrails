@@ -43,6 +43,7 @@ import { authRoutes } from './routes/auth.js'
 import { canaryRoutes } from './routes/canary.js'
 import { stripeRoutes, stripeWebhookRoute } from './routes/stripe.js'
 import { authenticate, optionalAuth, requireAdmin, requireRole, isFreeUser, freeSetFilter, getFreeSetIds } from './middleware/auth.js'
+import { applyHistoryDisplayFilter } from './services/historyDisplayFilter.js'
 
 /**
  * Express app with all `/api` routes. Pass a database instance (file or :memory: for tests).
@@ -60,23 +61,45 @@ export function createApp(db: Database) {
     allowedHeaders: ['Content-Type', 'Authorization'],
   }))
 
+  // Global API limiter. 300/15min was way too tight for an SPA that fires
+  // 20-40 parallel requests per page load (Cards tab alone: list + filters +
+  // detail + history + buy-links + watchlist + ...). An active user could
+  // hit 300 in 2-3 minutes, then be locked out of the whole app including
+  // login retry. 2000/15min ≈ 130/min is still stricter than the per-route
+  // limits that actually matter (auth), and more than enough for a human
+  // plus React Strict Mode double-renders in dev.
+  //
+  // We also exempt the auth routes from this limiter entirely: they have
+  // their own tighter limiter below, and we don't want a user who's been
+  // browsing to be unable to sign out and back in.
   const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 300,
+    max: 2000,
     standardHeaders: true,
     legacyHeaders: false,
-    skip: (req) => req.path === '/api/health',
+    skip: (req) =>
+      req.path === '/api/health' ||
+      req.path.startsWith('/api/auth/') ||
+      req.path.startsWith('/api/internal/'), // admin-only; JWT role-gated anyway
+    message: { error: 'Too many requests — slow down and try again in a minute.' },
   })
   app.use('/api', apiLimiter)
 
+  // Login/register have their own limiter so a bot spraying passwords can't
+  // burn through the global budget. 20/15min was ok security-wise but the
+  // same user/IP refreshing the page during a password-manager prompt could
+  // eat 5+ in a second. 40/15min keeps brute-force infeasible while giving
+  // a human plenty of room to mistype a password and retry.
   const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 20,
+    max: 40,
     standardHeaders: true,
     legacyHeaders: false,
+    message: { error: 'Too many login attempts — please wait a few minutes.' },
   })
   app.use('/api/auth/login', authLimiter)
   app.use('/api/auth/register', authLimiter)
+  app.use('/api/auth/google', authLimiter)
 
   app.use('/api/webhooks', express.raw({ type: 'application/json' }), stripeWebhookRoute(db))
 
@@ -323,11 +346,28 @@ export function createApp(db: Database) {
   //      value exists (cards.pc_price_bgs10); response is a single row with
   //      `pointInTime: true` so the UI renders a dashed reference line
   //      rather than a series.
+  //
+  // Display sanity filter: after we assemble the series, if the card has a
+  // PC anchor (pc_price_raw) we reject rows outside [anchor × 0.15, anchor ×
+  // 3.0]. This is a purely read-side guard — the DB keeps everything, so
+  // the next scrub pass can still see the bad rows. Without this, cards
+  // like Pikachu VMAX that have continuous-block contamination not yet
+  // cleaned by the scrub would show a rail of $3000 values next to their
+  // true $5 value. The 0.15/3.0 band is loose enough to preserve legitimate
+  // pumps/dips (a card tripling in a month is real) but tight enough to
+  // kill the 100x-1000x contamination documented in the Apr 2026 audit.
+  // If the filter would reject >60% of the series we bail out (anchor is
+  // probably stale) and return the raw series so the user can see SOMETHING.
   app.get('/api/cards/:id/history', optionalAuth, (req, res) => {
     const cardId = String(req.params.id)
     const card = db
-      .prepare(`SELECT id, set_id, pc_price_bgs10 FROM cards WHERE id = ?`)
-      .get(cardId) as { id: string; set_id: string | null; pc_price_bgs10: number | null } | undefined
+      .prepare(`SELECT id, set_id, pc_price_bgs10, pc_price_raw FROM cards WHERE id = ?`)
+      .get(cardId) as {
+      id: string
+      set_id: string | null
+      pc_price_bgs10: number | null
+      pc_price_raw: number | null
+    } | undefined
     if (!card) return res.status(404).json({ error: 'Not found' })
 
     if (isFreeUser(req) && card.set_id) {
@@ -450,8 +490,13 @@ export function createApp(db: Database) {
         params.push(cardId, cardId)
       }
 
-      const rows = db.prepare(sql).all(...params)
-      return res.json({ grade, source, pointInTime: false, series: rows })
+      const rawRows = db.prepare(sql).all(...params) as {
+        timestamp: string
+        price: number
+        source: string
+      }[]
+      const { series: clean, filtered } = applyHistoryDisplayFilter(rawRows, card.pc_price_raw)
+      return res.json({ grade, source, pointInTime: false, series: clean, filtered })
     }
 
     // Graded series live only in card_grade_history (PC-sourced). `source`
@@ -466,8 +511,29 @@ export function createApp(db: Database) {
          WHERE card_id = ? AND grade = ? AND price > 0
          ORDER BY ts ASC`,
       )
-      .all(cardId, grade)
-    res.json({ grade, source, pointInTime: false, series: rows })
+      .all(cardId, grade) as { timestamp: string; price: number; source: string }[]
+    // Graded series get the same display-filter, keyed off the matching
+    // card-level PC anchor when one exists (e.g. psa10 → pc_price_psa10).
+    const gradeAnchorMap: Record<string, keyof typeof card | null> = {
+      grade7: null, grade8: null, grade9: null, grade95: null, psa10: null,
+    }
+    // intentionally use pc_price_<grade> when present on the card row
+    const anchorRow = db
+      .prepare(
+        `SELECT pc_price_grade7, pc_price_grade8, pc_price_grade9,
+                pc_price_grade95, pc_price_psa10 FROM cards WHERE id = ?`,
+      )
+      .get(cardId) as Record<string, number | null> | undefined
+    const anchor =
+      grade === 'psa10' ? anchorRow?.pc_price_psa10 ?? null :
+      grade === 'grade95' ? anchorRow?.pc_price_grade95 ?? null :
+      grade === 'grade9' ? anchorRow?.pc_price_grade9 ?? null :
+      grade === 'grade8' ? anchorRow?.pc_price_grade8 ?? null :
+      grade === 'grade7' ? anchorRow?.pc_price_grade7 ?? null :
+      null
+    void gradeAnchorMap
+    const { series: clean, filtered } = applyHistoryDisplayFilter(rows, anchor ?? null)
+    res.json({ grade, source, pointInTime: false, series: clean, filtered })
   })
 
   app.get('/api/cards/:id/investment', authenticate, requireRole('premium', 'admin'), (req, res) => {

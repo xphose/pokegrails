@@ -59,39 +59,89 @@ function getRefreshToken(): string | null {
   return safeGetItem(REFRESH_TOKEN_KEY)
 }
 
-export async function refreshAccessToken(): Promise<string | null> {
-  const rt = getRefreshToken()
-  if (!rt) return null
+/**
+ * Pull the `exp` claim (seconds since epoch) out of a JWT without verifying
+ * the signature. Client-side we only use this as a "is this token stale?"
+ * hint — the server always re-verifies, so there's no security consequence
+ * to reading an untrusted payload here. Returns 0 for malformed tokens,
+ * which the caller treats as "expired" and refreshes.
+ */
+function readJwtExpSeconds(token: string): number {
+  const parts = token.split('.')
+  if (parts.length !== 3) return 0
   try {
-    const res = await fetch('/api/auth/refresh', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken: rt }),
-    })
-    if (!res.ok) {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')))
+    return typeof payload.exp === 'number' ? payload.exp : 0
+  } catch {
+    return 0
+  }
+}
+
+// Refresh a few seconds before expiry rather than waiting for the server
+// to 401. This avoids a whole class of UX bugs where an endpoint that
+// *could* serve a free-tier response (e.g. /api/cards with optionalAuth)
+// silently downgrades the user without signaling re-auth.
+const REFRESH_BUFFER_SEC = 30
+
+/**
+ * Serialize concurrent refresh calls: if three parallel fetches all see an
+ * expired token and all try to refresh, only the first hits the network;
+ * the others await the same promise. Without this, the first-to-finish
+ * would rotate the refresh token and invalidate the others mid-flight.
+ */
+let inflightRefresh: Promise<string | null> | null = null
+
+export async function refreshAccessToken(): Promise<string | null> {
+  if (inflightRefresh) return inflightRefresh
+  inflightRefresh = (async () => {
+    const rt = getRefreshToken()
+    if (!rt) return null
+    try {
+      const res = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: rt }),
+      })
+      if (!res.ok) {
+        clearTokens()
+        return null
+      }
+      const data = await res.json() as { accessToken: string; refreshToken: string }
+      setTokens(data.accessToken, data.refreshToken)
+      return data.accessToken
+    } catch {
       clearTokens()
       return null
+    } finally {
+      // allow the next refresh attempt even if this one errored
+      setTimeout(() => { inflightRefresh = null }, 0)
     }
-    const data = await res.json() as { accessToken: string; refreshToken: string }
-    setTokens(data.accessToken, data.refreshToken)
-    return data.accessToken
-  } catch {
-    clearTokens()
-    return null
-  }
+  })()
+  return inflightRefresh
+}
+
+/**
+ * Get a valid access token, proactively refreshing if expiry is within
+ * REFRESH_BUFFER_SEC. Returns null if no session or refresh failed. All
+ * authenticated fetch helpers (this file + lib/api.ts) go through this.
+ */
+export async function getValidAccessToken(): Promise<string | null> {
+  const t = getAccessToken()
+  if (!t) return null
+  const exp = readJwtExpSeconds(t)
+  const nowSec = Math.floor(Date.now() / 1000)
+  if (exp > 0 && exp - nowSec > REFRESH_BUFFER_SEC) return t
+  return refreshAccessToken()
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AuthState>({ user: null, loading: true })
 
   const fetchUser = useCallback(async () => {
-    const token = getAccessToken()
+    const token = await getValidAccessToken()
     if (!token) {
-      const refreshed = await refreshAccessToken()
-      if (!refreshed) {
-        setState({ user: null, loading: false })
-        return
-      }
+      setState({ user: null, loading: false })
+      return
     }
     try {
       const data = await authApi<{ user: User }>('/api/auth/me')
@@ -167,7 +217,7 @@ export function useAuth(): AuthContextType {
 }
 
 async function authApi<T>(path: string, init?: RequestInit): Promise<T> {
-  let token = getAccessToken()
+  let token = await getValidAccessToken()
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (token) headers['Authorization'] = `Bearer ${token}`
 
