@@ -482,6 +482,34 @@ export function Cards() {
     [fullHistory, trendWindow],
   )
 
+  /**
+   * Whether the *card* has any chartable data anywhere — current grade,
+   * current source, or any of the point-in-time PC grade anchors. We use
+   * this to decide whether to mount the whole price-history panel, so
+   * flipping to an empty (grade, source) combination doesn't unmount the
+   * buttons and strand the user. Previously we gated on `chartData.length
+   * > 1` which made the panel disappear whenever the active filter had no
+   * rows — e.g. clicking "PriceCharting" on a card that hasn't been
+   * backfilled yet. The buttons need to survive empty selections so the
+   * user can toggle back.
+   */
+  const cardHasAnyPriceData = useMemo(() => {
+    if (!sel) return false
+    if (chartData.length > 1) return true
+    if (gradeMeta?.pointInTime) return true
+    const anchors = [
+      sel.pc_price_raw,
+      sel.pc_price_grade7,
+      sel.pc_price_grade8,
+      sel.pc_price_grade9,
+      sel.pc_price_grade95,
+      sel.pc_price_psa10,
+      sel.pc_price_bgs10,
+      sel.market_price,
+    ]
+    return anchors.some((v) => v != null && v > 0)
+  }, [sel, chartData.length, gradeMeta?.pointInTime])
+
   useEffect(() => {
     setBrushRange(null)
   }, [trendWindow, sel?.id, chartData.length])
@@ -1076,7 +1104,7 @@ export function Cards() {
             {sel?.explain_json && <ModelExplainPanel json={sel.explain_json} />}
             {insight && <InvestmentInsightPanel insight={insight} />}
           </div>
-          {(chartData.length > 1 || gradeMeta?.pointInTime) && (
+          {cardHasAnyPriceData && (
             <div className="mt-4 rounded-lg border border-border/70 bg-muted/15 p-3">
               <div className="mb-2 flex flex-col gap-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1087,9 +1115,11 @@ export function Cards() {
                     <span
                       className="cursor-help text-[0.65rem] text-muted-foreground"
                       title={
-                        'Raw = ungraded market. Sources: TCGPlayer (live, outlier-gated) + PriceCharting ' +
-                        '"loose" series. PSA 9 / 9.5 / 10 come from PriceCharting graded charts. BGS 10 is ' +
-                        'a point-in-time reference only (no historical series available).'
+                        'Data sources:\n' +
+                        '• TCGPlayer — live market ticks from PokemonTCG.io feed, outlier-gated on ingest.\n' +
+                        '• PriceCharting point-in-time prices (raw / Grade 7-9.5 / PSA 10 / BGS 10) — PriceCharting API, authenticated with your API key.\n' +
+                        '• PriceCharting historical series (all grades except BGS 10) — PriceCharting public product pages (VGPC.chart_data). Same data PC displays on their own charts; no auth required.\n' +
+                        'Toggle "All" blends both with PriceCharting preferred on overlap. BGS 10 is a single point-in-time reference only.'
                       }
                     >
                       ⓘ
@@ -1148,9 +1178,15 @@ export function Cards() {
                   <span className="text-[0.65rem] uppercase tracking-wider text-muted-foreground">Source</span>
                   <div className="flex flex-wrap gap-1">
                     {CHART_SOURCE_OPTIONS.map((s) => {
-                      // Graded series are PC-only, so disable the TCG button
-                      // when viewing anything other than raw.
-                      const disabled = s.key === 'tcgplayer' && selectedGrade !== 'raw'
+                      // Graded series are PC-only (TCGPlayer doesn't publish
+                      // graded data); BGS 10 is PC-only by construction
+                      // (point-in-time reference). In both cases selecting
+                      // TCGPlayer would just return empty — disable to keep
+                      // the button meaningful and avoid a confusing empty
+                      // state the user can't escape from.
+                      const disabled =
+                        s.key === 'tcgplayer' &&
+                        (selectedGrade !== 'raw' || !!gradeMeta?.pointInTime)
                       return (
                         <Button
                           key={s.key}
@@ -1158,7 +1194,7 @@ export function Cards() {
                           size="xs"
                           variant={selectedSource === s.key ? 'secondary' : 'outline'}
                           onClick={() => setSelectedSource(s.key)}
-                          disabled={disabled || gradeMeta?.pointInTime}
+                          disabled={disabled}
                           title={
                             disabled
                               ? 'TCGPlayer does not publish graded series — select PriceCharting or All'
@@ -1180,7 +1216,7 @@ export function Cards() {
               }) && (
                 <div className="mb-2 rounded-md border border-border/70 bg-background/70 px-2 py-1.5">
                   <p className="mb-1 text-[0.65rem] uppercase tracking-wider text-muted-foreground">
-                    Current graded prices (PriceCharting)
+                    Current graded prices · PriceCharting API
                   </p>
                   <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[0.7rem] sm:grid-cols-5">
                     {CHART_GRADE_OPTIONS.map((g) => {
@@ -1304,8 +1340,21 @@ export function Cards() {
                   </AreaChart>
                 </ResponsiveContainer>
                 ) : (
-                  <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-                    Not enough data to display chart
+                  <div className="flex h-full flex-col items-center justify-center gap-1 px-4 text-center text-xs text-muted-foreground">
+                    {selectedSource === 'pricecharting' && selectedGrade === 'raw' ? (
+                      <>
+                        <span>No PriceCharting history for this card yet.</span>
+                        <span className="text-[0.65rem]">
+                          Backfill hasn't run for this card — try "All" or "TCGPlayer", or contact an admin to kick off a backfill.
+                        </span>
+                      </>
+                    ) : selectedSource === 'tcgplayer' && selectedGrade !== 'raw' ? (
+                      <span>TCGPlayer does not publish graded-card series — switch source to "PriceCharting" or "All".</span>
+                    ) : gradeMeta?.pointInTime ? (
+                      <span>This grade is a point-in-time reference only (no historical series available).</span>
+                    ) : (
+                      <span>Not enough data to display chart for this selection.</span>
+                    )}
                   </div>
                 )}
               </div>
