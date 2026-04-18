@@ -4,13 +4,12 @@ import type Database from 'better-sqlite3'
  * Multi-signal `price_history` scrub.
  *
  * The ingest gate in `pokemontcg.ts` prevents new bad ticks, but we have
- * historical contamination that predates it (1,997 cards on prod had ≥2x
- * spikes above their current market when this was written). Rather than a
- * single-threshold delete, this scrub uses three *independent* signals and
- * a conservative "how many fired" decision policy, which is the standard
- * robust-statistics approach to automated data cleaning:
+ * historical contamination that predates it. Rather than a single-threshold
+ * delete, this scrub uses five *independent* signals and a conservative
+ * "how many fired" decision policy, which is the standard robust-statistics
+ * approach to automated data cleaning:
  *
- *   Signal A — Cross-source disagreement.
+ *   Signal A — Cross-source disagreement (same row).
  *     If the same (card, day) has a `pricecharting_median` value, and
  *     `tcgplayer_market` > 2.5× that value, the TCGPlayer row disagrees
  *     with the authoritative PC number by a margin that isn't explainable
@@ -30,12 +29,35 @@ import type Database from 'better-sqlite3'
  *     *following* median returns to within 20% of pre-spike levels, it's
  *     a near-certain data error.
  *
+ *   Signal D — TCG self-inconsistency (row-local, no cross-source needed).
+ *     TCGPlayer ships `tcgplayer_low` on every row — that's the minimum of
+ *     current real listings. A `tcgplayer_market` > 5× its own `low` means
+ *     TCG's own envelope disagrees with itself (usually a single absurd
+ *     listing skewed the market calculation). This fires on contaminated
+ *     rows that pre-date the PriceCharting backfill, which is exactly the
+ *     regime the rest of the signals struggled with — they need PC data in
+ *     the same row that often doesn't exist for legacy history.
+ *
+ *   Signal E — Card-level PC anchor.
+ *     `cards.pc_price_raw` is the current PriceCharting raw median for the
+ *     card — a slow-moving, volume-smoothed reference. If a row's
+ *     `tcgplayer_market` is > 5× that anchor and the anchor exists and is
+ *     non-trivial ($5+), the row is almost certainly a data glitch. Unlike
+ *     Signal A, this doesn't require PC data in the same row; it uses the
+ *     point-in-time PC reference stamped on the `cards` table.
+ *
  * Decision policy per flagged row:
- *   - All three signals fire  → delete (high confidence error).
- *   - Two signals fire        → winsorize: replace value with the local
- *                                anchor (PC median when available, else
- *                                window median) and tag `source`.
- *   - One signal fires        → leave alone, but log.
+ *   - ≥3 signals fire  → delete (high confidence error).
+ *   - 2 signals fire   → winsorize: replace value with the best available
+ *                         anchor and tag `source='scrubbed-winsorized'`.
+ *   - 1 signal fires   → leave alone, but log.
+ *
+ * Winsorize anchor preference (most → least trusted):
+ *   1. `cards.pc_price_raw` (stable, PC-sourced, card-level ground truth).
+ *   2. Row's own `pricecharting_median` (when Signal A fired).
+ *   3. Row's own `tcgplayer_low` (TCGPlayer's floor — real listings).
+ *   4. 14-day rolling window median.
+ *   5. Row's current value (fallback; shouldn't happen post-flag).
  *
  * Safety net: if more than 25% of a card's history would be deleted in a
  * single pass, we skip that card entirely and log a warning. A scrub should
@@ -59,6 +81,7 @@ type HistoryRow = {
   card_id: string
   timestamp: string
   tcgplayer_market: number | null
+  tcgplayer_low: number | null
   pricecharting_median: number | null
   source: string | null
 }
@@ -73,17 +96,53 @@ export interface ScrubOptions {
   madMultiplier?: number
   spikeMultiplier?: number
   revertTolerance?: number
+  /** Signal D: multiplier over a row's own tcgplayer_low. */
+  tcgSelfMultiplier?: number
+  /** Signal E: multiplier over the card-level pc_price_raw anchor. */
+  pcAnchorMultiplier?: number
+  /** Signal E: minimum anchor value below which we don't trust it. */
+  pcAnchorFloor?: number
   windowDays?: number
   maxDeleteFraction?: number
+  /**
+   * Max number of scrub passes per card. Continuous-block contamination
+   * (e.g. two weeks where every row is bad) hides from MAD on pass 1
+   * because the rolling window is dominated by peers that are also bad.
+   * Re-running with the egregious rows already winsorized recomputes
+   * MAD on cleaner data and catches the remainder. Default 3 is enough
+   * for every real contamination pattern we've seen; convergence is
+   * quick because each pass strictly monotonically reduces the bad set.
+   */
+  maxPasses?: number
 }
 
 const DEFAULTS = {
   crossSourceMultiplier: 2.5,
-  madMultiplier: 5,
+  // 3-MAD is the standard robust-statistics outlier threshold (5-MAD is
+  // "extreme-only"; 3-MAD ≈ 99.7th percentile for thin tails, and handles
+  // fat-tailed card price distributions without over-firing). We used 5
+  // initially to be conservative but that left mid-tier contamination
+  // (2× overshoots) inside the "normal" band on cards with continuous-
+  // block contamination where MAD's own window is dominated by bad peers.
+  madMultiplier: 3,
   spikeMultiplier: 2,
   revertTolerance: 0.2,
+  // 2× for D and E is aggressive but safe because winsorize requires TWO
+  // independent signals to fire. D (market vs own low) and E (market vs
+  // card-level PC raw) firing together means BOTH TCG's floor AND the
+  // cross-source PC reference disagree with the row's market ≥2×, which
+  // is not legitimate volatility — that's a data error. The 2× threshold
+  // is what catches rows that are "bad but not egregious" (e.g. $1400
+  // where truth is $750), which 3× was leaving behind.
+  tcgSelfMultiplier: 2,
+  pcAnchorMultiplier: 2,
+  pcAnchorFloor: 5,
   windowDays: 7,
   maxDeleteFraction: 0.25,
+  // 5 passes is plenty — iteration converges monotonically and in
+  // practice Mew-shaped contamination (2 weeks continuous) settles in
+  // 2-3 passes. We cap at 5 just to bound worst-case runtime.
+  maxPasses: 5,
 }
 
 function median(xs: number[]): number {
@@ -122,10 +181,13 @@ export function scrubPriceHistory(db: Database.Database, opts: ScrubOptions = {}
   }
 
   const rowsStmt = db.prepare(
-    `SELECT rowid, card_id, timestamp, tcgplayer_market, pricecharting_median, source
+    `SELECT rowid, card_id, timestamp, tcgplayer_market, tcgplayer_low, pricecharting_median, source
      FROM price_history
      WHERE card_id = ? AND tcgplayer_market IS NOT NULL AND tcgplayer_market > 0
      ORDER BY timestamp ASC`,
+  )
+  const cardAnchorStmt = db.prepare(
+    `SELECT pc_price_raw FROM cards WHERE id = ?`,
   )
   const deleteStmt = db.prepare(`DELETE FROM price_history WHERE rowid = ?`)
   const winsorizeStmt = db.prepare(
@@ -135,115 +197,185 @@ export function scrubPriceHistory(db: Database.Database, opts: ScrubOptions = {}
   const windowMs = cfg.windowDays * 86_400_000
 
   for (const { card_id, total } of cards) {
-    const rows = rowsStmt.all(card_id) as HistoryRow[]
-    if (rows.length === 0) continue
     result.cardsExamined++
+    // Card-level PC anchor is constant for this card across all passes.
+    const cardAnchor =
+      (cardAnchorStmt.get(card_id) as { pc_price_raw: number | null } | undefined)?.pc_price_raw ?? null
+    const pcAnchorUsable = cardAnchor != null && cardAnchor >= cfg.pcAnchorFloor
 
-    type Flag = { row: HistoryRow; signals: number; localAnchor: number }
-    const flagged: Flag[] = []
+    let cardDeleted = 0
+    let cardWinsorized = 0
+    let cardFlagged = 0
+    let cardSkipped = false
 
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i]
-      if (row.source === 'pricecharting-chart') continue // never touch PC-sourced rows
-      const value = row.tcgplayer_market!
-      const ts = Date.parse(row.timestamp)
-      if (!Number.isFinite(ts)) continue
+    // Iteration loop. Each pass re-reads rows fresh (so MAD/window signals
+    // see the effect of prior passes' winsorizations), evaluates all five
+    // signals, and acts. We break early once a pass produces no changes,
+    // which is the common case for non-contaminated cards (single pass).
+    for (let pass = 0; pass < cfg.maxPasses; pass++) {
+      const rows = rowsStmt.all(card_id) as HistoryRow[]
+      if (rows.length === 0) break
 
-      // Build a symmetric 14-day window around this row (7d before + 7d after).
-      const winLow = ts - windowMs
-      const winHigh = ts + windowMs
-      const neighbours: number[] = []
-      for (let j = 0; j < rows.length; j++) {
-        if (j === i) continue
-        const tj = Date.parse(rows[j].timestamp)
-        if (tj >= winLow && tj <= winHigh && rows[j].tcgplayer_market && rows[j].tcgplayer_market! > 0) {
-          neighbours.push(rows[j].tcgplayer_market!)
+      // Precompute parsed timestamps once per pass — Date.parse is one of
+      // the hottest ops in the inner loops and doing it O(N²) times for
+      // large cards is what makes global scrubs slow.
+      const tsArr = new Float64Array(rows.length)
+      for (let k = 0; k < rows.length; k++) tsArr[k] = Date.parse(rows[k].timestamp)
+
+      type Flag = { row: HistoryRow; signals: number; localAnchor: number }
+      const flagged: Flag[] = []
+
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]
+        if (row.source === 'pricecharting-chart') continue // never touch PC-sourced rows
+        const value = row.tcgplayer_market!
+        const ts = tsArr[i]
+        if (!Number.isFinite(ts)) continue
+
+        // Build a symmetric 14-day window around this row (7d before + 7d after).
+        // rows are sorted ASC by timestamp, so we can walk outward from `i`
+        // and break once we leave the window on each side — reduces this
+        // from O(N²) to O(N·W) where W = avg neighbours per row.
+        const winLow = ts - windowMs
+        const winHigh = ts + windowMs
+        const neighbours: number[] = []
+        for (let j = i - 1; j >= 0; j--) {
+          const tj = tsArr[j]
+          if (tj < winLow) break
+          const v = rows[j].tcgplayer_market
+          if (v != null && v > 0) neighbours.push(v)
+        }
+        for (let j = i + 1; j < rows.length; j++) {
+          const tj = tsArr[j]
+          if (tj > winHigh) break
+          const v = rows[j].tcgplayer_market
+          if (v != null && v > 0) neighbours.push(v)
+        }
+
+        let signals = 0
+        // Collect every candidate anchor a signal produces, then pick the
+        // most-trusted one at the end (see preference list in file header).
+        const anchors: { value: number; prio: number }[] = []
+        const addAnchor = (v: number | null | undefined, prio: number) => {
+          if (v != null && Number.isFinite(v) && v > 0) anchors.push({ value: v, prio })
+        }
+
+        // Signal A: cross-source disagreement (same-row PC).
+        if (row.pricecharting_median && row.pricecharting_median > 0) {
+          if (value > cfg.crossSourceMultiplier * row.pricecharting_median) {
+            signals++
+            addAnchor(row.pricecharting_median, 2)
+          }
+        }
+
+        // Signal B: MAD outlier on the rolling window.
+        if (neighbours.length >= 3) {
+          const m = median(neighbours)
+          const d = mad(neighbours, m)
+          const scale = Math.max(d, 0.05 * m)
+          if (scale > 0 && Math.abs(value - m) > cfg.madMultiplier * scale) {
+            signals++
+            addAnchor(m, 4)
+          }
+        }
+
+        // Signal C: spike-and-revert. Same sort-exploiting trick — walk
+        // outward from i within the 3-day window and break when we leave.
+        const prior: number[] = []
+        const next: number[] = []
+        const threeDaysMs = 3 * 86_400_000
+        for (let j = i - 1; j >= 0; j--) {
+          const tj = tsArr[j]
+          const diff = ts - tj
+          if (diff > threeDaysMs) break
+          const v = rows[j].tcgplayer_market
+          if (v != null && v > 0) prior.push(v)
+        }
+        for (let j = i + 1; j < rows.length; j++) {
+          const tj = tsArr[j]
+          const diff = tj - ts
+          if (diff > threeDaysMs) break
+          const v = rows[j].tcgplayer_market
+          if (v != null && v > 0) next.push(v)
+        }
+        if (prior.length >= 1 && next.length >= 1) {
+          const priorMed = median(prior)
+          const nextMed = median(next)
+          const reverted = Math.abs(nextMed - priorMed) <= cfg.revertTolerance * priorMed
+          if (priorMed > 0 && value > cfg.spikeMultiplier * priorMed && reverted) {
+            signals++
+            addAnchor(priorMed, 4)
+          }
+        }
+
+        // Signal D: TCG self-inconsistency — market >> its own low.
+        if (row.tcgplayer_low != null && row.tcgplayer_low > 0) {
+          if (value > cfg.tcgSelfMultiplier * row.tcgplayer_low) {
+            signals++
+            addAnchor(row.tcgplayer_low, 3)
+          }
+        }
+
+        // Signal E: card-level PC anchor.
+        if (pcAnchorUsable && cardAnchor! > 0) {
+          if (value > cfg.pcAnchorMultiplier * cardAnchor!) {
+            signals++
+            addAnchor(cardAnchor!, 1)
+          }
+        }
+
+        if (signals >= 1) {
+          const sorted = [...anchors].sort((a, b) => a.prio - b.prio)
+          const localAnchor = sorted.length ? sorted[0].value : value
+          flagged.push({ row, signals, localAnchor })
         }
       }
 
-      let signals = 0
-      let localAnchor = value
+      // Safety net — check cumulative (across passes) deletion fraction.
+      const wouldDelete = flagged.filter((f) => f.signals >= 3).length
+      if ((cardDeleted + wouldDelete) > total * cfg.maxDeleteFraction) {
+        cardSkipped = true
+        cardFlagged += flagged.length
+        console.warn(
+          `[scrub] card=${card_id} pass=${pass} would push total deletions to ${
+            cardDeleted + wouldDelete
+          }/${total} (>${cfg.maxDeleteFraction * 100}%); halting passes — re-check anchor`,
+        )
+        break
+      }
 
-      // Signal A: cross-source disagreement.
-      if (row.pricecharting_median && row.pricecharting_median > 0) {
-        if (value > cfg.crossSourceMultiplier * row.pricecharting_median) {
-          signals++
-          localAnchor = row.pricecharting_median
+      let passDeleted = 0
+      let passWinsorized = 0
+      for (const f of flagged) {
+        if (f.signals >= 3) {
+          deleteStmt.run(f.row.rowid)
+          passDeleted++
+        } else if (f.signals === 2) {
+          winsorizeStmt.run(f.localAnchor, f.row.rowid)
+          passWinsorized++
         }
       }
 
-      // Signal B: MAD outlier on the rolling window.
-      if (neighbours.length >= 3) {
-        const m = median(neighbours)
-        const d = mad(neighbours, m)
-        const scale = Math.max(d, 0.05 * m)
-        if (scale > 0 && Math.abs(value - m) > cfg.madMultiplier * scale) {
-          signals++
-          if (localAnchor === value) localAnchor = m
-        }
-      }
+      cardDeleted += passDeleted
+      cardWinsorized += passWinsorized
+      cardFlagged += flagged.length
 
-      // Signal C: spike-and-revert.
-      const prior: number[] = []
-      const next: number[] = []
-      for (let j = 0; j < rows.length; j++) {
-        if (j === i) continue
-        const tj = Date.parse(rows[j].timestamp)
-        const diffDays = (tj - ts) / 86_400_000
-        if (rows[j].tcgplayer_market && rows[j].tcgplayer_market! > 0) {
-          if (diffDays < 0 && diffDays >= -3) prior.push(rows[j].tcgplayer_market!)
-          if (diffDays > 0 && diffDays <= 3) next.push(rows[j].tcgplayer_market!)
-        }
-      }
-      if (prior.length >= 1 && next.length >= 1) {
-        const priorMed = median(prior)
-        const nextMed = median(next)
-        const reverted = Math.abs(nextMed - priorMed) <= cfg.revertTolerance * priorMed
-        if (priorMed > 0 && value > cfg.spikeMultiplier * priorMed && reverted) {
-          signals++
-          if (localAnchor === value) localAnchor = priorMed
-        }
-      }
-
-      if (signals >= 1) flagged.push({ row, signals, localAnchor })
+      // Converged: nothing changed this pass, further passes would be no-ops.
+      if (passDeleted === 0 && passWinsorized === 0) break
     }
 
-    // Safety net — never drop more than 25% of a card's history in one pass.
-    const wouldDelete = flagged.filter((f) => f.signals >= 3).length
-    if (wouldDelete > total * cfg.maxDeleteFraction) {
-      result.cardsSkipped++
-      if (result.details) {
-        result.details.push({
-          cardId: card_id,
-          deleted: 0,
-          winsorized: 0,
-          flagged: flagged.length,
-          skipped: true,
-        })
-      }
-      console.warn(
-        `[scrub] card=${card_id} would delete ${wouldDelete}/${total} rows (>${cfg.maxDeleteFraction * 100}%); skipping — re-check anchor`,
-      )
-      continue
-    }
-
-    let deleted = 0
-    let winsorized = 0
-    for (const f of flagged) {
-      if (f.signals >= 3) {
-        deleteStmt.run(f.row.rowid)
-        deleted++
-      } else if (f.signals === 2) {
-        winsorizeStmt.run(f.localAnchor, f.row.rowid)
-        winsorized++
-      }
-    }
-
-    result.rowsDeleted += deleted
-    result.rowsWinsorized += winsorized
-    result.rowsFlagged += flagged.length
+    result.rowsDeleted += cardDeleted
+    result.rowsWinsorized += cardWinsorized
+    result.rowsFlagged += cardFlagged
+    if (cardSkipped) result.cardsSkipped++
     if (result.details) {
-      result.details.push({ cardId: card_id, deleted, winsorized, flagged: flagged.length, skipped: false })
+      result.details.push({
+        cardId: card_id,
+        deleted: cardDeleted,
+        winsorized: cardWinsorized,
+        flagged: cardFlagged,
+        skipped: cardSkipped,
+      })
     }
   }
 

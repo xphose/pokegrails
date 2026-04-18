@@ -100,6 +100,87 @@ describe('GET /api/cards/:id/history?grade=...', () => {
     const r = await request(createApp(db)).get('/api/cards/does-not-exist/history')
     expect(r.status).toBe(404)
   })
+
+  it('source=tcgplayer returns only TCGPlayer-originated rows', async () => {
+    const db = openMemoryDb()
+    cacheInvalidateAll()
+    seedMinimalCard(db)
+    // Mix of TCG ticks and PC rows on different days.
+    db.prepare(
+      `INSERT INTO price_history (card_id, timestamp, tcgplayer_market) VALUES (?, ?, ?)`,
+    ).run('test-card-1', isoDay(3), 10)
+    db.prepare(
+      `INSERT INTO price_history (card_id, timestamp, pricecharting_median, source)
+       VALUES (?, ?, ?, 'pricecharting-chart')`,
+    ).run('test-card-1', isoDay(2), 15)
+    db.prepare(
+      `INSERT INTO card_grade_history (card_id, grade, ts, price) VALUES (?, ?, ?, ?)`,
+    ).run('test-card-1', 'raw', isoDay(1), 20)
+
+    const r = await request(createApp(db)).get('/api/cards/test-card-1/history?source=tcgplayer')
+    expect(r.status).toBe(200)
+    expect(r.body.source).toBe('tcgplayer')
+    expect(r.body.series.length).toBe(1)
+    expect(r.body.series[0].price).toBe(10)
+    expect(r.body.series[0].source).toBe('tcgplayer')
+  })
+
+  it('source=pricecharting returns PC-sourced rows (price_history + card_grade_history)', async () => {
+    const db = openMemoryDb()
+    cacheInvalidateAll()
+    seedMinimalCard(db)
+    db.prepare(
+      `INSERT INTO price_history (card_id, timestamp, tcgplayer_market) VALUES (?, ?, ?)`,
+    ).run('test-card-1', isoDay(3), 10)
+    db.prepare(
+      `INSERT INTO price_history (card_id, timestamp, pricecharting_median, source)
+       VALUES (?, ?, ?, 'pricecharting-chart')`,
+    ).run('test-card-1', isoDay(2), 15)
+    db.prepare(
+      `INSERT INTO card_grade_history (card_id, grade, ts, price) VALUES (?, ?, ?, ?)`,
+    ).run('test-card-1', 'raw', isoDay(1), 20)
+
+    const r = await request(createApp(db)).get('/api/cards/test-card-1/history?source=pricecharting')
+    expect(r.status).toBe(200)
+    expect(r.body.source).toBe('pricecharting')
+    expect(r.body.series.length).toBe(2) // the PC ones
+    expect(r.body.series.every((p: any) => p.price === 15 || p.price === 20)).toBe(true)
+  })
+
+  it('source filter on graded series: tcgplayer is empty, pricecharting returns the series', async () => {
+    const db = openMemoryDb()
+    cacheInvalidateAll()
+    seedMinimalCard(db)
+    db.prepare(
+      `INSERT INTO card_grade_history (card_id, grade, ts, price) VALUES (?, ?, ?, ?)`,
+    ).run('test-card-1', 'psa10', isoDay(1), 450)
+
+    const tcg = await request(createApp(db)).get('/api/cards/test-card-1/history?grade=psa10&source=tcgplayer')
+    expect(tcg.body.series.length).toBe(0)
+    const pc = await request(createApp(db)).get('/api/cards/test-card-1/history?grade=psa10&source=pricecharting')
+    expect(pc.body.series.length).toBe(1)
+    expect(pc.body.series[0].price).toBe(450)
+  })
+
+  it('rejects unknown source values with 400', async () => {
+    const db = openMemoryDb()
+    cacheInvalidateAll()
+    seedMinimalCard(db)
+    const r = await request(createApp(db)).get('/api/cards/test-card-1/history?source=ebay')
+    expect(r.status).toBe(400)
+  })
+
+  it('bgs10 + source=tcgplayer returns empty (no TCG graded series)', async () => {
+    const db = openMemoryDb()
+    cacheInvalidateAll()
+    seedMinimalCard(db)
+    db.prepare(`UPDATE cards SET pc_price_bgs10 = 1200 WHERE id = ?`).run('test-card-1')
+
+    const r = await request(createApp(db)).get('/api/cards/test-card-1/history?grade=bgs10&source=tcgplayer')
+    expect(r.status).toBe(200)
+    expect(r.body.pointInTime).toBe(true)
+    expect(r.body.series.length).toBe(0)
+  })
 })
 
 describe('card_grade_history migration', () => {

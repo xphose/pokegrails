@@ -308,14 +308,19 @@ export function createApp(db: Database) {
 
   // Per-grade history for the chart's Grade toggle.
   //
-  //   /api/cards/:id/history?grade=raw      — default; union of
+  //   /api/cards/:id/history?grade=raw                 — default; union of
   //      price_history.tcgplayer_market (live TCGPlayer ticks, outlier-gated)
   //      and card_grade_history raw series (PC chart). Same-day collisions
   //      prefer PC as the more stable number.
-  //   /api/cards/:id/history?grade=psa9|psa10|grade95 — reads directly from
-  //      card_grade_history.
-  //   /api/cards/:id/history?grade=bgs10  — only a point-in-time value
-  //      exists (cards.pc_price_bgs10); response is a single row with
+  //   /api/cards/:id/history?grade=raw&source=tcgplayer — TCGPlayer-only.
+  //      Useful when the user wants to see the raw live-market series without
+  //      any cross-source substitution.
+  //   /api/cards/:id/history?grade=raw&source=pricecharting — PriceCharting-only.
+  //   /api/cards/:id/history?grade=psa9|psa10|grade95    — reads directly from
+  //      card_grade_history (always PC-sourced; source filter is a no-op
+  //      here — tcgplayer returns [] since TCG has no graded series).
+  //   /api/cards/:id/history?grade=bgs10                — only a point-in-time
+  //      value exists (cards.pc_price_bgs10); response is a single row with
   //      `pointInTime: true` so the UI renders a dashed reference line
   //      rather than a series.
   app.get('/api/cards/:id/history', optionalAuth, (req, res) => {
@@ -333,60 +338,128 @@ export function createApp(db: Database) {
     }
 
     const grade = (typeof req.query.grade === 'string' ? req.query.grade : 'raw').toLowerCase()
-    const VALID = ['raw', 'grade7', 'grade8', 'grade9', 'grade95', 'psa10', 'bgs10']
-    if (!VALID.includes(grade)) {
-      return res.status(400).json({ error: `invalid grade; use one of ${VALID.join(', ')}` })
+    const VALID_GRADES = ['raw', 'grade7', 'grade8', 'grade9', 'grade95', 'psa10', 'bgs10']
+    if (!VALID_GRADES.includes(grade)) {
+      return res.status(400).json({ error: `invalid grade; use one of ${VALID_GRADES.join(', ')}` })
+    }
+
+    const source = (typeof req.query.source === 'string' ? req.query.source : 'both').toLowerCase()
+    const VALID_SOURCES = ['both', 'tcgplayer', 'pricecharting']
+    if (!VALID_SOURCES.includes(source)) {
+      return res.status(400).json({ error: `invalid source; use one of ${VALID_SOURCES.join(', ')}` })
     }
 
     if (grade === 'bgs10') {
-      if (card.pc_price_bgs10 == null) {
-        return res.json({ grade, pointInTime: true, series: [] })
+      if (card.pc_price_bgs10 == null || source === 'tcgplayer') {
+        return res.json({ grade, source, pointInTime: true, series: [] })
       }
-      // Stamp "now" on the point so UIs that plot time-vs-price can render
-      // a horizontal reference line without faking a series.
       return res.json({
         grade,
+        source,
         pointInTime: true,
-        series: [{ timestamp: new Date().toISOString(), price: card.pc_price_bgs10 }],
+        series: [{ timestamp: new Date().toISOString(), price: card.pc_price_bgs10, source: 'pricecharting' }],
       })
     }
 
     if (grade === 'raw') {
-      // Union live TCGPlayer + PC chart + PC grade-history raw series.
-      // Same-day collisions prefer PC (prio=0) over TCGPlayer (prio=1)
-      // because PC's median is volume-smoothed and more stable. The
-      // ROW_NUMBER window function deduplicates per day deterministically;
-      // SQLite 3.25+ supports it and is bundled with better-sqlite3.
-      const rows = db
-        .prepare(
-          `WITH unioned AS (
-             SELECT substr(timestamp, 1, 10) AS ts,
-                    COALESCE(pricecharting_median, tcgplayer_market) AS price,
-                    CASE WHEN pricecharting_median IS NOT NULL THEN 'pricecharting' ELSE 'tcgplayer' END AS source,
-                    CASE WHEN pricecharting_median IS NOT NULL THEN 0 ELSE 1 END AS prio
-             FROM price_history
-             WHERE card_id = ?
-               AND COALESCE(pricecharting_median, tcgplayer_market) IS NOT NULL
-               AND COALESCE(pricecharting_median, tcgplayer_market) > 0
-             UNION ALL
-             SELECT substr(ts, 1, 10) AS ts, price, 'pricecharting-grade' AS source, 0 AS prio
-             FROM card_grade_history
-             WHERE card_id = ? AND grade = 'raw' AND price > 0
-           ),
-           ranked AS (
-             SELECT ts, price, source,
-                    ROW_NUMBER() OVER (PARTITION BY ts ORDER BY prio) AS rn
-             FROM unioned
-           )
-           SELECT ts AS timestamp, price, source
-           FROM ranked
-           WHERE rn = 1
-           ORDER BY ts ASC`,
-        )
-        .all(cardId, cardId)
-      return res.json({ grade, pointInTime: false, series: rows })
+      // Three compositions depending on `source`:
+      //  - 'both'           : prefer PC over TCG on same-day collisions.
+      //  - 'tcgplayer'      : only rows whose authoritative value came from
+      //                       price_history.tcgplayer_market. Post-scrub
+      //                       rows tagged 'scrubbed-winsorized' still qualify
+      //                       (they originated as TCG ticks).
+      //  - 'pricecharting'  : union of price_history.pricecharting_median
+      //                       rows + card_grade_history raw series, with
+      //                       PC preferred on collision (card_grade_history
+      //                       tends to be denser/longer-running).
+      let sql: string
+      const params: any[] = []
+
+      if (source === 'tcgplayer') {
+        // Dedup to per-day (same shape as the other branches) — keep the
+        // latest tick of each day as the canonical value. Without this the
+        // chart would jitter to 5-7x density when the user flipped from
+        // All → TCGPlayer, which is a confusing UX.
+        sql = `
+          WITH per_day AS (
+            SELECT substr(timestamp, 1, 10) AS ts,
+                   tcgplayer_market AS price,
+                   ROW_NUMBER() OVER (PARTITION BY substr(timestamp, 1, 10) ORDER BY timestamp DESC) AS rn
+            FROM price_history
+            WHERE card_id = ?
+              AND tcgplayer_market IS NOT NULL
+              AND tcgplayer_market > 0
+              AND (source IS NULL OR source NOT IN ('pricecharting-chart'))
+          )
+          SELECT ts AS timestamp, price, 'tcgplayer' AS source
+          FROM per_day WHERE rn = 1
+          ORDER BY ts ASC`
+        params.push(cardId)
+      } else if (source === 'pricecharting') {
+        sql = `
+          WITH pc_rows AS (
+            SELECT substr(timestamp, 1, 10) AS ts,
+                   pricecharting_median AS price,
+                   'pricecharting' AS source,
+                   1 AS prio
+            FROM price_history
+            WHERE card_id = ?
+              AND pricecharting_median IS NOT NULL
+              AND pricecharting_median > 0
+            UNION ALL
+            SELECT substr(ts, 1, 10) AS ts,
+                   price,
+                   'pricecharting-grade' AS source,
+                   0 AS prio
+            FROM card_grade_history
+            WHERE card_id = ? AND grade = 'raw' AND price > 0
+          ),
+          ranked AS (
+            SELECT ts, price, source,
+                   ROW_NUMBER() OVER (PARTITION BY ts ORDER BY prio) AS rn
+            FROM pc_rows
+          )
+          SELECT ts AS timestamp, price, source
+          FROM ranked WHERE rn = 1
+          ORDER BY ts ASC`
+        params.push(cardId, cardId)
+      } else {
+        sql = `
+          WITH unioned AS (
+            SELECT substr(timestamp, 1, 10) AS ts,
+                   COALESCE(pricecharting_median, tcgplayer_market) AS price,
+                   CASE WHEN pricecharting_median IS NOT NULL THEN 'pricecharting' ELSE 'tcgplayer' END AS source,
+                   CASE WHEN pricecharting_median IS NOT NULL THEN 0 ELSE 1 END AS prio
+            FROM price_history
+            WHERE card_id = ?
+              AND COALESCE(pricecharting_median, tcgplayer_market) IS NOT NULL
+              AND COALESCE(pricecharting_median, tcgplayer_market) > 0
+            UNION ALL
+            SELECT substr(ts, 1, 10) AS ts, price, 'pricecharting-grade' AS source, 0 AS prio
+            FROM card_grade_history
+            WHERE card_id = ? AND grade = 'raw' AND price > 0
+          ),
+          ranked AS (
+            SELECT ts, price, source,
+                   ROW_NUMBER() OVER (PARTITION BY ts ORDER BY prio) AS rn
+            FROM unioned
+          )
+          SELECT ts AS timestamp, price, source
+          FROM ranked WHERE rn = 1
+          ORDER BY ts ASC`
+        params.push(cardId, cardId)
+      }
+
+      const rows = db.prepare(sql).all(...params)
+      return res.json({ grade, source, pointInTime: false, series: rows })
     }
 
+    // Graded series live only in card_grade_history (PC-sourced). `source`
+    // filter is effectively a noop here — tcgplayer returns [] because we
+    // don't have graded TCG data, and pricecharting/both return the series.
+    if (source === 'tcgplayer') {
+      return res.json({ grade, source, pointInTime: false, series: [] })
+    }
     const rows = db
       .prepare(
         `SELECT ts AS timestamp, price, source FROM card_grade_history
@@ -394,7 +467,7 @@ export function createApp(db: Database) {
          ORDER BY ts ASC`,
       )
       .all(cardId, grade)
-    res.json({ grade, pointInTime: false, series: rows })
+    res.json({ grade, source, pointInTime: false, series: rows })
   })
 
   app.get('/api/cards/:id/investment', authenticate, requireRole('premium', 'admin'), (req, res) => {

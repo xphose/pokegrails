@@ -188,6 +188,13 @@ type BrushRange = { startIndex: number; endIndex: number }
  * column.
  */
 type ChartGradeKey = 'raw' | 'grade9' | 'grade95' | 'psa10' | 'bgs10'
+type ChartSourceKey = 'both' | 'tcgplayer' | 'pricecharting'
+
+const CHART_SOURCE_OPTIONS: { key: ChartSourceKey; label: string; long: string }[] = [
+  { key: 'both', label: 'All', long: 'All sources (PC preferred on overlap)' },
+  { key: 'pricecharting', label: 'PriceCharting', long: 'PriceCharting only' },
+  { key: 'tcgplayer', label: 'TCGPlayer', long: 'TCGPlayer only (live ticks, outlier-gated)' },
+]
 
 const CHART_GRADE_OPTIONS: { key: ChartGradeKey; label: string; long: string }[] = [
   { key: 'raw',     label: 'Raw',     long: 'Raw (ungraded)' },
@@ -299,6 +306,7 @@ export function Cards() {
   const [insight, setInsight] = useState<CardInvestmentInsight | null>(null)
   const [buyLinks, setBuyLinks] = useState<{ tcgplayer: string; ebay: string; whatnot: string } | null>(null)
   const [selectedGrade, setSelectedGrade] = useState<ChartGradeKey>('raw')
+  const [selectedSource, setSelectedSource] = useState<ChartSourceKey>('both')
   const [gradeMeta, setGradeMeta] = useState<{ pointInTime: boolean } | null>(null)
 
   useEffect(() => {
@@ -423,10 +431,10 @@ export function Cards() {
    * but tag `gradeMeta.pointInTime` so the chart can render it as a reference
    * line rather than a misleading flat series.
    */
-  const fetchGradeHistory = async (cardId: string, grade: ChartGradeKey) => {
+  const fetchGradeHistory = async (cardId: string, grade: ChartGradeKey, source: ChartSourceKey) => {
     try {
-      const r = await api<{ grade: string; pointInTime: boolean; series: { timestamp: string; price: number }[] }>(
-        `/api/cards/${cardId}/history?grade=${grade}`,
+      const r = await api<{ grade: string; source: string; pointInTime: boolean; series: { timestamp: string; price: number }[] }>(
+        `/api/cards/${cardId}/history?grade=${grade}&source=${source}`,
       )
       setGradeMeta({ pointInTime: !!r.pointInTime })
       setHist(r.series.map((p) => ({ timestamp: p.timestamp, tcgplayer_market: p.price })))
@@ -442,7 +450,8 @@ export function Cards() {
     setInsight(null)
     setBrushRange(null)
     setSelectedGrade('raw')
-    await fetchGradeHistory(c.id, 'raw')
+    setSelectedSource('both')
+    await fetchGradeHistory(c.id, 'raw', 'both')
     try {
       const i = await api<CardInvestmentInsight>(`/api/cards/${c.id}/investment`)
       setInsight(i)
@@ -459,12 +468,12 @@ export function Cards() {
     }
   }
 
-  // Refetch when the user toggles grade on an already-open card.
+  // Refetch when the user toggles grade OR source on an already-open card.
   useEffect(() => {
     if (!sel || !open) return
-    void fetchGradeHistory(sel.id, selectedGrade)
+    void fetchGradeHistory(sel.id, selectedGrade, selectedSource)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedGrade, sel?.id])
+  }, [selectedGrade, selectedSource, sel?.id])
 
   const fullHistory = useMemo(() => buildFullHistory(hist), [hist])
 
@@ -1130,6 +1139,34 @@ export function Cards() {
                           aria-label={`Show ${g.long} history`}
                         >
                           {g.label}
+                        </Button>
+                      )
+                    })}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[0.65rem] uppercase tracking-wider text-muted-foreground">Source</span>
+                  <div className="flex flex-wrap gap-1">
+                    {CHART_SOURCE_OPTIONS.map((s) => {
+                      // Graded series are PC-only, so disable the TCG button
+                      // when viewing anything other than raw.
+                      const disabled = s.key === 'tcgplayer' && selectedGrade !== 'raw'
+                      return (
+                        <Button
+                          key={s.key}
+                          type="button"
+                          size="xs"
+                          variant={selectedSource === s.key ? 'secondary' : 'outline'}
+                          onClick={() => setSelectedSource(s.key)}
+                          disabled={disabled || gradeMeta?.pointInTime}
+                          title={
+                            disabled
+                              ? 'TCGPlayer does not publish graded series — select PriceCharting or All'
+                              : s.long
+                          }
+                          aria-label={`Filter chart to ${s.long}`}
+                        >
+                          {s.label}
                         </Button>
                       )
                     })}
