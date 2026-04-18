@@ -59,8 +59,16 @@ describeIfLocal('data sanity against local snapshot', () => {
     return
   }
 
-  // Can't open readonly — `createApp` bootstraps a heartbeat table. The
-  // sanity tests themselves never write; they issue GET requests.
+  // IMPORTANT: `describe.skip` still invokes this callback to register the
+  // skipped tests — so any DB work at this scope runs on CI where no
+  // snapshot exists. Guard the DB open + sample query behind the haveLocal
+  // check, otherwise better-sqlite3 creates a fresh DB file and the sample
+  // query blows up on the missing `cards` table.
+  if (!haveLocal) {
+    it.skip(skipMsg, () => { /* placeholder so vitest sees a test */ })
+    return
+  }
+
   const db = new Database(LOCAL_DB)
   const app = createApp(db)
   const token = adminToken()
