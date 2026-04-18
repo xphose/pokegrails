@@ -340,10 +340,16 @@ export function Cards() {
     let cancelled = false
     ;(async () => {
       try {
-        const c = await api<CardRow>(`/api/cards/${deepLinkId}`)
+        // /api/cards/:id returns { card, priceHistory } — unwrap to the
+        // CardRow shape that openDetail / setSel expect. Without this
+        // unwrap the detail dialog mounts with an empty object and every
+        // field render is undefined, producing the "auto-opened but empty"
+        // bug verified via runtime logs (deepLinkId=undefined loop).
+        const resp = await api<{ card: CardRow }>(`/api/cards/${deepLinkId}`)
+        const c = resp.card
         if (cancelled) return
         // #region agent log
-        fetch('http://127.0.0.1:7308/ingest/ab1dabe4-139b-4e33-a5c9-bbead4ed210c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba40ef'},body:JSON.stringify({sessionId:'ba40ef',hypothesisId:'A',location:'Cards.tsx:deepLinkEffect.fetched',message:'api/cards/:id resolved',data:{deepLinkId,cardId:c?.id,cardName:c?.name,pcPsa10:c?.pc_price_psa10},timestamp:Date.now()})}).catch(()=>{});
+        fetch('http://127.0.0.1:7308/ingest/ab1dabe4-139b-4e33-a5c9-bbead4ed210c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba40ef'},body:JSON.stringify({sessionId:'ba40ef',runId:'post-fix',hypothesisId:'A',location:'Cards.tsx:deepLinkEffect.fetched',message:'api/cards/:id resolved (unwrapped)',data:{deepLinkId,cardId:c?.id,cardName:c?.name,pcPsa10:c?.pc_price_psa10,respKeys:Object.keys(resp||{})},timestamp:Date.now()})}).catch(()=>{});
         // #endregion
         await openDetail(c)
       } catch (e) {
