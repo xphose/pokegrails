@@ -6,25 +6,43 @@ const PC_BASE = 'https://www.pricecharting.com'
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 let lastRequest = 0
 
-// PriceCharting is fronted by Cloudflare and rejects bot-like User-Agents
-// (`PokeGrails/1.0` got served the "Just a moment..." 403 interstitial 2-out-of-3
-// times during a 2026-04-18 prod probe — see git log for the full RCA). Browser
-// UAs pass cleanly. Keep this in sync with a recent stable Chrome release.
+// PriceCharting is fronted by Cloudflare, which intermittently serves a
+// "Just a moment..." 403 challenge regardless of User-Agent. A 2026-04-18
+// prod probe of `/api/product?id=6277151` showed ~33% 403 rate even with a
+// realistic Chrome UA (chrome-current run1=200, run2=403, run3=200). Without
+// retries, Phase 2a/3 of the backfill silently no-ops on every challenged
+// request — that's why the production DB had 0 `card_grade_history` rows
+// despite 5,712 cards being matched.
+//
+// Mitigation: send a browser-shaped UA (helps marginally) AND retry up to
+// twice on 403 with progressive backoff. With ~66% per-attempt success,
+// 3 attempts ≈ 96% effective success rate.
 const PC_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+const PC_RETRY_DELAYS_MS = [3000, 6000] as const
 
 async function throttledFetch(url: string, minGapMs = 1100): Promise<Response> {
-  const elapsed = Date.now() - lastRequest
-  if (elapsed < minGapMs) await sleep(minGapMs - elapsed)
-  lastRequest = Date.now()
-  return fetch(url, {
-    headers: {
-      'User-Agent': PC_UA,
-      Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-    signal: AbortSignal.timeout(20_000),
-  })
+  let attempt = 0
+  let resp: Response
+  while (true) {
+    const elapsed = Date.now() - lastRequest
+    if (elapsed < minGapMs) await sleep(minGapMs - elapsed)
+    lastRequest = Date.now()
+    resp = await fetch(url, {
+      headers: {
+        'User-Agent': PC_UA,
+        Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      signal: AbortSignal.timeout(20_000),
+    })
+    // Retry only on Cloudflare's challenge status. Other non-2xx (e.g. 404
+    // for an invalid product slug, 401 for a bad token) are real errors and
+    // shouldn't burn extra requests against the rate budget.
+    if (resp.status !== 403 || attempt >= PC_RETRY_DELAYS_MS.length) return resp
+    await sleep(PC_RETRY_DELAYS_MS[attempt])
+    attempt++
+  }
 }
 
 function slugify(text: string): string {
