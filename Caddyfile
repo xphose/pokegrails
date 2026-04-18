@@ -9,7 +9,15 @@
 		-Server
 	}
 
-	reverse_proxy app:3001
+	# NOTE: use the unambiguous container name `pokegrails`, not the service
+	# alias `app`. The dev compose project (`pokegrails-dev/docker-compose.dev.yml`)
+	# also registers `app` on the shared `pokegrails_web` network, so Docker's
+	# embedded DNS returns BOTH container IPs for `app:3001`, and Caddy then
+	# round-robins — silently sending ~50% of prod traffic to the dev container.
+	# That was the root cause of the 2026-04-18 "prod is running pre-af5cc65 code"
+	# ghost-deploy incident: the new image was live, but half the requests were
+	# being served by the long-lived dev container.
+	reverse_proxy pokegrails:3001
 
 	log {
 		output file /data/access.log {
