@@ -87,12 +87,17 @@ SSH="ssh $SSH_OPTS $USER@$HOST"
 SCP="scp $SSH_OPTS"
 
 echo "[snapshot] → $USER@$HOST: taking .backup snapshot (WAL-consistent)"
+# `docker compose exec -T` reads from stdin, and stdin on the remote side
+# is the heredoc itself. Without `< /dev/null` the first exec would
+# greedily swallow every subsequent line of this script as sqlite3 SQL
+# input, so `docker compose cp` never actually runs. Pinning stdin to
+# /dev/null for each exec keeps the heredoc intact for bash to execute.
 $SSH bash -s <<REMOTE
 set -euo pipefail
 cd /opt/pokegrails
-docker compose exec -T app sqlite3 /app/data/pokegrails.sqlite ".backup /app/data/snapshot-$STAMP.sqlite"
+docker compose exec -T app sqlite3 /app/data/pokegrails.sqlite ".backup /app/data/snapshot-$STAMP.sqlite" < /dev/null
 docker compose cp app:/app/data/snapshot-$STAMP.sqlite $REMOTE_SNAPSHOT
-docker compose exec -T app rm -f /app/data/snapshot-$STAMP.sqlite
+docker compose exec -T app rm -f /app/data/snapshot-$STAMP.sqlite < /dev/null
 ls -lh $REMOTE_SNAPSHOT
 REMOTE
 
