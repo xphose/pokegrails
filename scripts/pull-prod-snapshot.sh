@@ -111,15 +111,17 @@ echo "[snapshot] local size: $(du -h "$SNAPSHOT" | awk '{print $1}')"
 if [ "$KEEP_SECRETS" = "0" ]; then
   LOCAL_PW="${POKEGRAILS_LOCAL_PASSWORD:-devdev123}"
   echo "[snapshot] sanitizing — keeping $ADMIN_EMAIL as admin, wiping other users & all tokens"
-  # Hash the dev password with bcrypt so it matches auth.ts expectations.
-  # Uses the server workspace's bcrypt dependency; runs from apps/server so
-  # Node resolves it whether npm hoisted to root node_modules or not.
-  if [ ! -d "$REPO_ROOT/apps/server/node_modules" ] && [ ! -d "$REPO_ROOT/node_modules/bcrypt" ]; then
-    echo "[snapshot] node_modules missing — running npm install first so we can hash the dev password"
+  # Hash the dev password with bcryptjs so it matches auth.ts expectations
+  # (auth.ts imports from 'bcryptjs', the pure-JS variant; 'bcrypt' is a
+  # different package with a native addon and is NOT a server dep).
+  # Runs from apps/server so Node resolves bcryptjs whether npm hoisted it
+  # to apps/server/node_modules or to the workspace root node_modules.
+  if [ ! -d "$REPO_ROOT/apps/server/node_modules/bcryptjs" ] && [ ! -d "$REPO_ROOT/node_modules/bcryptjs" ]; then
+    echo "[snapshot] bcryptjs not found — running npm install first so we can hash the dev password"
     (cd "$REPO_ROOT" && npm install --silent)
   fi
   PW_HASH="$(cd "$REPO_ROOT/apps/server" && PW="$LOCAL_PW" node -e "
-    const bcrypt = require('bcrypt')
+    const bcrypt = require('bcryptjs')
     bcrypt.hash(process.env.PW, 12).then(h => process.stdout.write(h))
   ")"
   sqlite3 "$SNAPSHOT" <<SQL
