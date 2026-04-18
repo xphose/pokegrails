@@ -6,12 +6,23 @@ const PC_BASE = 'https://www.pricecharting.com'
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 let lastRequest = 0
 
+// PriceCharting is fronted by Cloudflare and rejects bot-like User-Agents
+// (`PokeGrails/1.0` got served the "Just a moment..." 403 interstitial 2-out-of-3
+// times during a 2026-04-18 prod probe — see git log for the full RCA). Browser
+// UAs pass cleanly. Keep this in sync with a recent stable Chrome release.
+const PC_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+
 async function throttledFetch(url: string, minGapMs = 1100): Promise<Response> {
   const elapsed = Date.now() - lastRequest
   if (elapsed < minGapMs) await sleep(minGapMs - elapsed)
   lastRequest = Date.now()
   return fetch(url, {
-    headers: { 'User-Agent': 'PokeGrails/1.0', Accept: '*/*' },
+    headers: {
+      'User-Agent': PC_UA,
+      Accept: 'application/json,text/html;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
     signal: AbortSignal.timeout(20_000),
   })
 }
@@ -88,6 +99,14 @@ async function matchCard(token: string, name: string, number: string, setName?: 
 async function fetchPcMeta(token: string, pcId: string): Promise<{ consoleName: string; productName: string; gradedPrices: GradedPrices } | null> {
   const url = `${PC_BASE}/api/product?t=${token}&id=${pcId}`
   const resp = await throttledFetch(url)
+  // #region agent log (temporary — verifying Cloudflare UA fix; remove after post-fix verification)
+  if (!resp.ok) {
+    const head = (await resp.clone().text()).slice(0, 120).replace(/\s+/g, ' ')
+    console.log(`[pc-backfill][debug] fetchPcMeta ${pcId} → status=${resp.status} body[:120]="${head}"`)
+  } else {
+    console.log(`[pc-backfill][debug] fetchPcMeta ${pcId} → status=200 ok`)
+  }
+  // #endregion
   if (!resp.ok) return null
   const d = (await resp.json()) as Record<string, unknown>
   if (d.status !== 'success') return null
