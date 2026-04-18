@@ -100,6 +100,17 @@ export interface ScrubOptions {
   tcgSelfMultiplier?: number
   /** Signal E: multiplier over the card-level pc_price_raw anchor. */
   pcAnchorMultiplier?: number
+  /**
+   * Hard-cap: if `tcgplayer_market > pcAnchorHardMultiplier × pc_price_raw`,
+   * act immediately regardless of other signals (single-signal winsorize).
+   * This catches the "TCG and PC disagree across the whole series" pattern
+   * that the 2-signal gate misses — basep-40 (Pokémon Center) had a TCG
+   * listing band of $7k vs a PC raw anchor of $1.1k, stable across 30+
+   * days, so no other signal fired. 3× is a confident threshold — legit
+   * TCG-leads-PC moves during a real pump rarely exceed 2×, and PC's
+   * nightly re-anchor catches up within 24h.
+   */
+  pcAnchorHardMultiplier?: number
   /** Signal E: minimum anchor value below which we don't trust it. */
   pcAnchorFloor?: number
   windowDays?: number
@@ -136,6 +147,7 @@ const DEFAULTS = {
   // where truth is $750), which 3× was leaving behind.
   tcgSelfMultiplier: 2,
   pcAnchorMultiplier: 2,
+  pcAnchorHardMultiplier: 3,
   pcAnchorFloor: 5,
   windowDays: 7,
   maxDeleteFraction: 0.25,
@@ -316,11 +328,25 @@ export function scrubPriceHistory(db: Database.Database, opts: ScrubOptions = {}
           }
         }
 
-        // Signal E: card-level PC anchor.
+        // Signal E: card-level PC anchor. Fires at 2× (1 signal).
+        const signalsBeforeE = signals
         if (pcAnchorUsable && cardAnchor! > 0) {
           if (value > cfg.pcAnchorMultiplier * cardAnchor!) {
             signals++
             addAnchor(cardAnchor!, 1)
+          }
+          // Hard-cap: if E fires at ≥3× AND nothing else fired, promote to
+          // 2-signal status so it alone is winsorize-sufficient. We gate on
+          // "no other signal fired" so hard-cap never escalates an already-
+          // double-signaled row into delete territory — winsorize is the
+          // right action when we have a high-confidence PC anchor and the
+          // delete path (3+ signals) is reserved for "multiple independent
+          // witnesses of trash data" cases where reconstruction is risky.
+          if (
+            signalsBeforeE === 0 &&
+            value > cfg.pcAnchorHardMultiplier * cardAnchor!
+          ) {
+            signals++ // 1 → 2, winsorize
           }
         }
 

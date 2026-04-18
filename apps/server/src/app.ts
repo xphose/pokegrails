@@ -818,12 +818,37 @@ export function createApp(db: Database) {
     res.json({ ok: true })
   })
 
+  // POST /api/internal/backfill-pricecharting          — full catalog (6+ hrs)
+  //     ?force=1                                       — re-scrape even if already have history
+  //     ?cardId=sv4pt5-232                             — one card; skips sealed (fast, ~5s)
+  //     ?setId=sv4pt5                                  — one set
+  //     ?limit=500                                     — top-N by market_price
+  //     ?skipSealed=1                                  — skip Phase 4 on full run
   app.post('/api/internal/backfill-pricecharting', authenticate, requireAdmin, async (req, res) => {
     const { runPricechartingBackfill } = await import('./services/pricechartingBackfill.js')
-    const force = req.query.force === '1' || req.query.force === 'true'
-    res.json({ ok: true, message: `Backfill started in background (force=${force}) — watch server console for progress` })
+    const opts: {
+      force?: boolean
+      cardId?: string
+      setId?: string
+      limit?: number
+      skipSealed?: boolean
+    } = {
+      force: req.query.force === '1' || req.query.force === 'true',
+      skipSealed: req.query.skipSealed === '1' || req.query.skipSealed === 'true',
+    }
+    if (typeof req.query.cardId === 'string' && req.query.cardId) opts.cardId = req.query.cardId
+    if (typeof req.query.setId === 'string' && req.query.setId) opts.setId = req.query.setId
+    if (typeof req.query.limit === 'string') {
+      const n = parseInt(req.query.limit, 10)
+      if (Number.isFinite(n) && n > 0) opts.limit = n
+    }
+    res.json({
+      ok: true,
+      message: `Backfill started in background — watch server console`,
+      opts,
+    })
     try {
-      const stats = await runPricechartingBackfill(db, { force })
+      const stats = await runPricechartingBackfill(db, opts)
       console.log('[backfill] Finished:', stats)
     } catch (e) {
       console.error('[backfill] Failed:', e)

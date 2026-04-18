@@ -311,7 +311,23 @@ export interface BackfillStats {
   gradeHistoryRows?: number
 }
 
-export async function runPricechartingBackfill(db: Database.Database, opts: { force?: boolean } = {}): Promise<BackfillStats> {
+export interface BackfillOptions {
+  /** Re-scrape even if we already have ≥6 PC rows. Default false. */
+  force?: boolean
+  /** Restrict to a specific card (e.g. "sv4pt5-232"). Phase 4 (sealed) is skipped. */
+  cardId?: string
+  /** Restrict to cards in a single set. Phase 4 (sealed) still runs. */
+  setId?: string
+  /** Cap the number of cards considered (after ordering by market_price DESC). */
+  limit?: number
+  /** Skip Phase 4 (sealed catalog). Default false. */
+  skipSealed?: boolean
+}
+
+export async function runPricechartingBackfill(
+  db: Database.Database,
+  opts: BackfillOptions = {},
+): Promise<BackfillStats> {
   const token = config.pricechartingApiKey
   if (!token) {
     console.log('[pc-backfill] No PRICECHARTING_API_KEY configured, aborting')
@@ -320,20 +336,36 @@ export async function runPricechartingBackfill(db: Database.Database, opts: { fo
 
   console.log('[pc-backfill] ═══════════════════════════════════════')
   console.log('[pc-backfill] PriceCharting Historical Backfill START')
+  console.log(
+    `[pc-backfill]   scope: ${
+      opts.cardId ? `cardId=${opts.cardId}` : opts.setId ? `setId=${opts.setId}` : 'ALL'
+    }${opts.limit ? ` limit=${opts.limit}` : ''} force=${!!opts.force} skipSealed=${!!opts.skipSealed}`,
+  )
   console.log('[pc-backfill] ═══════════════════════════════════════')
 
   const stats: BackfillStats = { cardsMatched: 0, cardsScraped: 0, sealedScraped: 0, errors: 0 }
 
   /* ── Phase 1: Match cards to PriceCharting product IDs ────── */
+  const filters: string[] = [`c.name IS NOT NULL`]
+  const params: any[] = []
+  if (opts.cardId) {
+    filters.push(`c.id = ?`)
+    params.push(opts.cardId)
+  }
+  if (opts.setId) {
+    filters.push(`c.set_id = ?`)
+    params.push(opts.setId)
+  }
+  const limitClause = opts.limit && opts.limit > 0 ? ` LIMIT ${Math.floor(opts.limit)}` : ''
   const cards = db
     .prepare(
       `SELECT c.id, c.name, c.set_id, c.market_price, c.pricecharting_id, s.name AS set_name
        FROM cards c
        LEFT JOIN sets s ON c.set_id = s.id
-       WHERE c.name IS NOT NULL
-       ORDER BY COALESCE(c.market_price, 0) DESC`,
+       WHERE ${filters.join(' AND ')}
+       ORDER BY COALESCE(c.market_price, 0) DESC${limitClause}`,
     )
-    .all() as {
+    .all(...params) as {
     id: string
     name: string
     set_id: string | null
@@ -456,6 +488,22 @@ export async function runPricechartingBackfill(db: Database.Database, opts: { fo
   }
 
   console.log(`[pc-backfill] Phase 3 done — ${stats.cardsScraped} card charts stored`)
+
+  // Phase 4 runs only for full or set-scoped backfills. Single-card runs are
+  // debugging/targeted ops that shouldn't block on the 30+ sealed scrapes.
+  if (opts.cardId || opts.skipSealed) {
+    console.log(`[pc-backfill] Phase 4 skipped (scope=${opts.cardId ? 'single card' : 'skipSealed'})`)
+    stats.gradeHistoryRows = (
+      db.prepare(`SELECT COUNT(*) as c FROM card_grade_history`).get() as { c: number }
+    ).c
+    console.log('[pc-backfill] ═══════════════════════════════════════')
+    console.log(
+      `[pc-backfill] COMPLETE — matched: ${stats.cardsMatched}, scraped: ${stats.cardsScraped}, ` +
+        `grade-history rows: ${stats.gradeHistoryRows}, errors: ${stats.errors}`,
+    )
+    console.log('[pc-backfill] ═══════════════════════════════════════')
+    return stats
+  }
 
   /* ── Phase 4: Sealed product historical prices ────────────── */
   console.log(`[pc-backfill] Phase 4: Scraping sealed product history...`)

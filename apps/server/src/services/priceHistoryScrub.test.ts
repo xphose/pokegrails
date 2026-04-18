@@ -186,6 +186,41 @@ describe('scrubPriceHistory', () => {
     if (winsor) expect(winsor.tcgplayer_market).not.toBe(2) // not the below-floor anchor
   })
 
+  it('hard-cap: single-signal E at ≥3× pc_price_raw is sufficient to winsorize', () => {
+    // basep-40 (Pokémon Center) pattern: stable $7000 TCG market with
+    // $7777 low across 30+ days, PC raw anchor $1121. D can't fire
+    // (market < low), B/C are blind (no spike within the window). Only
+    // E fires — and it must act alone because the anchor is ground truth.
+    setCardPcAnchor(db, 'test-card-1', 1000)
+    const rows: Array<{ daysAgo: number; market: number; low: number }> = []
+    // 30 days of TCG listing at $7000 market / $7777 low — market < low,
+    // so D is silent and MAD is silent (all rows identical).
+    for (let i = 30; i >= 0; i--) rows.push({ daysAgo: i, market: 7000, low: 7777 })
+    addHistory(db, 'test-card-1', rows)
+    const r = scrubPriceHistory(db)
+    expect(r.rowsWinsorized).toBeGreaterThan(0)
+    const max = db
+      .prepare(`SELECT MAX(tcgplayer_market) AS mx FROM price_history WHERE card_id='test-card-1'`)
+      .get() as { mx: number }
+    // Should be capped at the PC anchor (1000), not 2× or 3× of it.
+    expect(max.mx).toBeLessThanOrEqual(1000)
+  })
+
+  it('hard-cap does NOT fire at 2× pc_price_raw when no other signals fire', () => {
+    // A legit TCG-leads-PC short-term move of ~2×. Single-signal E at
+    // 2× should still NOT trigger (needs the 3× hard threshold, or a
+    // second concurring signal like D/B).
+    setCardPcAnchor(db, 'test-card-1', 500)
+    const rows: Array<{ daysAgo: number; market: number; low: number }> = []
+    // 30 stable days at $1100 / low $1050 — 2.2× anchor, no other signal.
+    for (let i = 30; i >= 0; i--) rows.push({ daysAgo: i, market: 1100, low: 1050 })
+    addHistory(db, 'test-card-1', rows)
+    const r = scrubPriceHistory(db)
+    // E fires once (>2×) but no hard-cap bonus (<3×). Only 1 signal → no action.
+    expect(r.rowsDeleted).toBe(0)
+    expect(r.rowsWinsorized).toBe(0)
+  })
+
   it('narrows scope when cardId option is provided', () => {
     db.prepare(
       `INSERT INTO cards (id, name, set_id, rarity, image_url, character_name, card_type, market_price, last_updated)
