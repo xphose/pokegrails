@@ -66,10 +66,14 @@ export function startCronJobs(db: Database.Database) {
   }))
 
   // Weekly PriceCharting Phase 1/2/3 backfill: discovers + fuzzy-matches
-  // new cards (where the CSV's `tcg-id` doesn't help us) and scrapes the
-  // longer historical chart for new matches. Runs Sunday 03:00 UTC. The
-  // circuit breaker in pricechartingBackfill.ts auto-aborts if the prod
-  // IP gets rate-limited, so this won't make a Cloudflare ban worse.
+  // NEW cards (where the CSV's `tcg-id` doesn't help us) and scrapes the
+  // longer historical chart for those new matches ONLY. Phase 3 is gated
+  // by an idempotency check that skips any card already having
+  // card_grade_history rows tagged source='pricecharting-chart' — so this
+  // never re-fetches history for the ~5,700 cards backfilled via
+  // scripts/pc-history-scrape.mjs on 2026-04-18. Runs Sunday 03:00 UTC.
+  // The circuit breaker in pricechartingBackfill.ts auto-aborts if the
+  // prod IP gets rate-limited, so this won't make a Cloudflare ban worse.
   cron.schedule('0 3 * * 0', safe('pc-backfill', async () => {
     await runPricechartingBackfill(db, { force: false })
   }))

@@ -691,9 +691,26 @@ async function runPricechartingBackfillInner(
     }
   }
 
-  /* ── Phase 3: Scrape chart history for all matched cards ── */
+  /* ── Phase 3: Scrape chart history for all matched cards ──
+   *
+   * Steady-state design (post 2026-04-18 backfill):
+   *   - Per-card chart history is a ONE-SHOT import. Once a card has any
+   *     `card_grade_history` rows tagged source='pricecharting-chart' we
+   *     never scrape it again — the daily CSV ingest keeps `card_grade_history`
+   *     fresh from there on.
+   *   - PriceCharting publishes monthly snapshots (1st of each month). The
+   *     daily CSV continuously updates the current-month value, so the chart
+   *     UI cleanly hands off from the monthly historical series to our
+   *     denser daily series.
+   *   - The bulk historical backfill ran from a clean workspace IP via
+   *     `scripts/pc-history-scrape.mjs` (Cloudflare bans the prod IP after
+   *     sustained scraping). This in-server Phase 3 path stays in place for
+   *     newly-matched cards that get added later, but the idempotency check
+   *     below ensures we never re-fetch a card whose chart we already have.
+   */
   const hasHistStmt = db.prepare(
-    `SELECT COUNT(*) as c FROM price_history WHERE card_id = ? AND pricecharting_median IS NOT NULL`,
+    `SELECT COUNT(*) as c FROM card_grade_history
+       WHERE card_id = ? AND source = 'pricecharting-chart'`,
   )
   const cardsWithMeta = cards.filter((c) => c.pricecharting_id && pcMeta.has(c.id))
 
@@ -706,7 +723,7 @@ async function runPricechartingBackfillInner(
     const meta = pcMeta.get(card.id)!
 
     const histCount = (hasHistStmt.get(card.id) as { c: number }).c
-    if (!opts.force && histCount >= 6) {
+    if (!opts.force && histCount >= 1) {
       stats.cardsScraped++
       continue
     }

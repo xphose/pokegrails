@@ -330,9 +330,6 @@ export function Cards() {
   // current filter / sort / scroll position.
   const lastOpenedDeepLinkRef = useRef<string | null>(null)
   useEffect(() => {
-    // #region agent log
-    fetch('http://127.0.0.1:7308/ingest/ab1dabe4-139b-4e33-a5c9-bbead4ed210c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba40ef'},body:JSON.stringify({sessionId:'ba40ef',hypothesisId:'A',location:'Cards.tsx:deepLinkEffect',message:'deepLink effect fired',data:{deepLinkId,selId:sel?.id??null,alreadyOpened:lastOpenedDeepLinkRef.current},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     if (!deepLinkId) return
     if (sel?.id === deepLinkId) return
     if (lastOpenedDeepLinkRef.current === deepLinkId) return
@@ -344,18 +341,12 @@ export function Cards() {
         // CardRow shape that openDetail / setSel expect. Without this
         // unwrap the detail dialog mounts with an empty object and every
         // field render is undefined, producing the "auto-opened but empty"
-        // bug verified via runtime logs (deepLinkId=undefined loop).
+        // bug seen on 2026-04-18.
         const resp = await api<{ card: CardRow }>(`/api/cards/${deepLinkId}`)
         const c = resp.card
         if (cancelled) return
-        // #region agent log
-        fetch('http://127.0.0.1:7308/ingest/ab1dabe4-139b-4e33-a5c9-bbead4ed210c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba40ef'},body:JSON.stringify({sessionId:'ba40ef',runId:'post-fix',hypothesisId:'A',location:'Cards.tsx:deepLinkEffect.fetched',message:'api/cards/:id resolved (unwrapped)',data:{deepLinkId,cardId:c?.id,cardName:c?.name,pcPsa10:c?.pc_price_psa10,respKeys:Object.keys(resp||{})},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         await openDetail(c)
-      } catch (e) {
-        // #region agent log
-        fetch('http://127.0.0.1:7308/ingest/ab1dabe4-139b-4e33-a5c9-bbead4ed210c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba40ef'},body:JSON.stringify({sessionId:'ba40ef',hypothesisId:'A',location:'Cards.tsx:deepLinkEffect.error',message:'api/cards/:id failed',data:{deepLinkId,error:String(e)},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
+      } catch {
         // Card not found (404) or session expired — silently fall back to
         // the list view so the user can search instead of seeing a stuck
         // loading spinner.
@@ -512,18 +503,12 @@ export function Cards() {
    */
   const fetchGradeHistory = async (cardId: string, grade: ChartGradeKey, source: ChartSourceKey) => {
     try {
-      const r = await api<{ grade: string; source: string; pointInTime: boolean; series: { timestamp: string; price: number }[]; filtered?: number }>(
+      const r = await api<{ grade: string; source: string; pointInTime: boolean; series: { timestamp: string; price: number }[] }>(
         `/api/cards/${cardId}/history?grade=${grade}&source=${source}`,
       )
-      // #region agent log
-      fetch('http://127.0.0.1:7308/ingest/ab1dabe4-139b-4e33-a5c9-bbead4ed210c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba40ef'},body:JSON.stringify({sessionId:'ba40ef',runId:'post-fix',hypothesisId:'B',location:'Cards.tsx:fetchGradeHistory',message:'/history response',data:{cardId,grade,source,seriesLen:r.series.length,filtered:r.filtered,pointInTime:r.pointInTime,first:r.series[0]??null,last:r.series[r.series.length-1]??null},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       setGradeMeta({ pointInTime: !!r.pointInTime })
       setHist(r.series.map((p) => ({ timestamp: p.timestamp, tcgplayer_market: p.price })))
-    } catch (e) {
-      // #region agent log
-      fetch('http://127.0.0.1:7308/ingest/ab1dabe4-139b-4e33-a5c9-bbead4ed210c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba40ef'},body:JSON.stringify({sessionId:'ba40ef',runId:'post-fix',hypothesisId:'B',location:'Cards.tsx:fetchGradeHistory.error',message:'/history failed',data:{cardId,grade,source,error:String(e)},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
+    } catch {
       setGradeMeta(null)
       setHist([])
     }
