@@ -9,6 +9,8 @@ import { recordPriceSnapshot } from './priceHistory.js'
 import { refreshSetMetrics } from './setMetrics.js'
 import { notifyPriceAlerts } from './push.js'
 import { refreshSealedPrices } from './sealedPrices.js'
+import { runPricechartingBackfill } from './pricechartingBackfill.js'
+import { scrubPriceHistory } from './priceHistoryScrub.js'
 import { takePredictionSnapshot } from './trackRecord.js'
 import { trainGradientBoostModel } from './analytics/gradientBoost.js'
 import { computeFeatureImportance } from './analytics/featureImportance.js'
@@ -52,6 +54,24 @@ export function startCronJobs(db: Database.Database) {
   cron.schedule('0 0 * * *', safe('prediction-snapshot', () => takePredictionSnapshot(db)))
   cron.schedule('*/15 * * * *', safe('alerts', () => notifyPriceAlerts(db)))
   cron.schedule('0 */12 * * *', safe('sealed', async () => { await refreshSealedPrices(db) }))
+
+  // Nightly PriceCharting backfill: matches new cards, fetches point-in-time
+  // graded prices, and scrapes the full per-grade chart history into
+  // `card_grade_history`. Skips already-matched cards and cards with ≥6
+  // history points, so steady-state runs are fast.
+  cron.schedule('0 2 * * *', safe('pc-backfill', async () => {
+    await runPricechartingBackfill(db, { force: false })
+  }))
+
+  // Weekly scrub pass: re-checks all of `price_history` against the latest
+  // PriceCharting anchor + 14-day MAD window + spike-and-revert detector,
+  // purging any outliers that slipped through the ingest gates. Runs weekly
+  // rather than daily because PC data has to settle first and the scrub
+  // touches every card.
+  cron.schedule('0 4 * * 0', safe('price-scrub', async () => {
+    const result = scrubPriceHistory(db)
+    console.log('[cron price-scrub]', result)
+  }))
 }
 
 const HTTP_CACHE_TTL = 1_800_000

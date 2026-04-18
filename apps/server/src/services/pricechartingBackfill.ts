@@ -102,9 +102,25 @@ async function fetchPcMeta(token: string, pcId: string): Promise<{ consoleName: 
 
 type ChartPoints = [number, number][]
 
+/**
+ * Full PriceCharting `VGPC.chart_data` blob. For Pokémon cards, the series
+ * names are repurposed from PriceCharting's video-game schema:
+ *   - `used`       → raw / ungraded
+ *   - `cib`        → Grade 7
+ *   - `new`        → Grade 8
+ *   - `graded`     → Grade 9
+ *   - `boxonly`    → Grade 9.5
+ *   - `manualonly` → PSA 10
+ * BGS 10 only ships as a point-in-time value in the product API, not here.
+ * Sealed-box pages reuse `used` for condition "used" and `new` for sealed.
+ */
 interface ChartData {
   used: ChartPoints
   newSealed: ChartPoints
+  cib: ChartPoints
+  graded: ChartPoints
+  boxOnly: ChartPoints
+  manualOnly: ChartPoints
 }
 
 async function scrapeChart(consoleName: string, productName: string): Promise<ChartData | null> {
@@ -131,24 +147,49 @@ function extractChartJson(html: string): ChartData | null {
   if (end < 0) return null
   try {
     const raw = JSON.parse(html.slice(start + marker.length, end + 1)) as Record<string, unknown>
+    const asPoints = (k: string): ChartPoints => (Array.isArray(raw[k]) ? (raw[k] as ChartPoints) : [])
     return {
-      used: Array.isArray(raw.used) ? (raw.used as ChartPoints) : [],
-      newSealed: Array.isArray(raw.new) ? (raw.new as ChartPoints) : [],
+      used: asPoints('used'),
+      newSealed: asPoints('new'),
+      cib: asPoints('cib'),
+      graded: asPoints('graded'),
+      boxOnly: asPoints('boxonly'),
+      manualOnly: asPoints('manualonly'),
     }
   } catch {
     return null
   }
 }
 
+/**
+ * Maps VGPC series keys to the grade labels we persist in `card_grade_history`.
+ * Keep these labels stable — the API route and UI toggle both key off them.
+ */
+const GRADE_SERIES: { key: keyof ChartData; grade: string }[] = [
+  { key: 'used',       grade: 'raw' },
+  { key: 'cib',        grade: 'grade7' },
+  { key: 'newSealed',  grade: 'grade8' }, // "new" in the source JSON → Grade 8 for cards
+  { key: 'graded',     grade: 'grade9' },
+  { key: 'boxOnly',    grade: 'grade95' },
+  { key: 'manualOnly', grade: 'psa10' },
+]
+
 /* ── Phase 3: Store historical data ────────────────────────── */
 
 function storeCardHistory(db: Database.Database, cardId: string, points: ChartPoints) {
+  // Dual-write: `pricecharting_median` is the authoritative PC number;
+  // `tcgplayer_market` is also populated (only when the row doesn't already
+  // have one) so the existing chart-history query and downstream analytics
+  // that key off `tcgplayer_market` keep working until they're migrated to
+  // the new per-grade API. The `source` column records that this row came
+  // from the PC chart scrape rather than a live TCGPlayer tick.
   const stmt = db.prepare(
-    `INSERT INTO price_history (card_id, timestamp, tcgplayer_market, tcgplayer_low, ebay_median, pricecharting_median)
-     VALUES (@cid, @ts, @tcg, NULL, NULL, @pc)
+    `INSERT INTO price_history (card_id, timestamp, tcgplayer_market, tcgplayer_low, ebay_median, pricecharting_median, source)
+     VALUES (@cid, @ts, @tcg, NULL, NULL, @pc, 'pricecharting-chart')
      ON CONFLICT(card_id, timestamp) DO UPDATE SET
        pricecharting_median = excluded.pricecharting_median,
-       tcgplayer_market = COALESCE(price_history.tcgplayer_market, excluded.tcgplayer_market)`,
+       tcgplayer_market = COALESCE(price_history.tcgplayer_market, excluded.tcgplayer_market),
+       source = COALESCE(price_history.source, excluded.source)`,
   )
 
   const tx = db.transaction(() => {
@@ -157,6 +198,33 @@ function storeCardHistory(db: Database.Database, cardId: string, points: ChartPo
       const dollars = pennies / 100
       const ts = new Date(epochMs).toISOString().split('T')[0] + 'T00:00:00.000Z'
       stmt.run({ cid: cardId, ts, tcg: dollars, pc: dollars })
+    }
+  })
+  tx()
+}
+
+/**
+ * Store all six PriceCharting grade series (raw / 7 / 8 / 9 / 9.5 / PSA 10)
+ * for a single card into `card_grade_history`. Zero-priced points in the
+ * series mean "not available on that date" — we skip them so the UI doesn't
+ * render straight-to-zero dips.
+ */
+function storeCardGradeHistory(db: Database.Database, cardId: string, chart: ChartData) {
+  const stmt = db.prepare(
+    `INSERT INTO card_grade_history (card_id, grade, ts, price, source)
+     VALUES (@cid, @grade, @ts, @price, 'pricecharting-chart')
+     ON CONFLICT(card_id, grade, ts) DO UPDATE SET price = excluded.price`,
+  )
+  const tx = db.transaction(() => {
+    for (const { key, grade } of GRADE_SERIES) {
+      const points = chart[key]
+      if (!Array.isArray(points)) continue
+      for (const [epochMs, pennies] of points) {
+        if (!pennies || pennies <= 0) continue
+        const dollars = pennies / 100
+        const ts = new Date(epochMs).toISOString().split('T')[0] + 'T00:00:00.000Z'
+        stmt.run({ cid: cardId, grade, ts, price: dollars })
+      }
     }
   })
   tx()
@@ -239,6 +307,8 @@ export interface BackfillStats {
   cardsScraped: number
   sealedScraped: number
   errors: number
+  /** Running grade-history row count after this backfill pass. */
+  gradeHistoryRows?: number
 }
 
 export async function runPricechartingBackfill(db: Database.Database, opts: { force?: boolean } = {}): Promise<BackfillStats> {
@@ -367,6 +437,11 @@ export async function runPricechartingBackfill(db: Database.Database, opts: { fo
       const chart = await scrapeChart(meta.consoleName, meta.productName)
       if (chart && chart.used.length > 0) {
         storeCardHistory(db, card.id, chart.used)
+        // Also persist all six graded series (raw/7/8/9/9.5/PSA10) into
+        // card_grade_history so the UI can toggle between them. `used` is
+        // duplicated as 'raw' inside storeCardGradeHistory — the dual write
+        // into price_history above remains for backwards compat.
+        storeCardGradeHistory(db, card.id, chart)
         stats.cardsScraped++
       }
     } catch {
@@ -424,8 +499,13 @@ export async function runPricechartingBackfill(db: Database.Database, opts: { fo
   const totalSealed = (existingSealedCount.get() as { c: number }).c
   console.log(`[pc-backfill] Phase 4 done — ${stats.sealedScraped} sealed products, ${totalSealed} total historical rows`)
 
+  stats.gradeHistoryRows = (db.prepare(`SELECT COUNT(*) as c FROM card_grade_history`).get() as { c: number }).c
+
   console.log('[pc-backfill] ═══════════════════════════════════════')
-  console.log(`[pc-backfill] COMPLETE — matched: ${stats.cardsMatched}, scraped: ${stats.cardsScraped}, sealed: ${stats.sealedScraped}, errors: ${stats.errors}`)
+  console.log(
+    `[pc-backfill] COMPLETE — matched: ${stats.cardsMatched}, scraped: ${stats.cardsScraped}, ` +
+      `sealed: ${stats.sealedScraped}, grade-history rows: ${stats.gradeHistoryRows}, errors: ${stats.errors}`,
+  )
   console.log('[pc-backfill] ═══════════════════════════════════════')
 
   return stats

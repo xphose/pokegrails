@@ -54,6 +54,34 @@ if (isPrimary) {
   } else {
     console.log(`[primary] warm DB (${cardCount} cards) — skipping initial ingest; cron will refresh`)
   }
+
+  // One-shot PriceCharting backfill + scrub when the DB has never been
+  // matched. This is the only path that populates `pc_price_*` columns and
+  // `card_grade_history`; without it the "Grade" toggle in the UI is empty.
+  // Guarded by API-key presence + a zero-match check, so it runs exactly
+  // once per install and is a no-op otherwise.
+  if (config.pricechartingApiKey) {
+    const pcMatched = (
+      db.prepare('SELECT COUNT(*) AS c FROM cards WHERE pricecharting_id IS NOT NULL').get() as
+        | { c: number }
+        | undefined
+    )?.c ?? 0
+    if (pcMatched === 0) {
+      console.log('[primary] no PriceCharting matches found — scheduling background backfill + scrub')
+      setImmediate(async () => {
+        try {
+          const { runPricechartingBackfill } = await import('./services/pricechartingBackfill.js')
+          const { scrubPriceHistory } = await import('./services/priceHistoryScrub.js')
+          const stats = await runPricechartingBackfill(db, { force: false })
+          console.log('[primary] initial pc-backfill complete:', stats)
+          const scrubResult = scrubPriceHistory(db)
+          console.log('[primary] post-backfill scrub complete:', scrubResult)
+        } catch (e) {
+          console.error('[primary] initial pc-backfill failed:', e)
+        }
+      })
+    }
+  }
 } else {
   console.log(`[worker ${workerId}] HTTP-only — cron jobs + ingest handled by worker 0`)
 }

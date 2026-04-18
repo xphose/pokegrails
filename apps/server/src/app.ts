@@ -306,6 +306,97 @@ export function createApp(db: Database) {
     res.json({ card: row, priceHistory: hist })
   })
 
+  // Per-grade history for the chart's Grade toggle.
+  //
+  //   /api/cards/:id/history?grade=raw      — default; union of
+  //      price_history.tcgplayer_market (live TCGPlayer ticks, outlier-gated)
+  //      and card_grade_history raw series (PC chart). Same-day collisions
+  //      prefer PC as the more stable number.
+  //   /api/cards/:id/history?grade=psa9|psa10|grade95 — reads directly from
+  //      card_grade_history.
+  //   /api/cards/:id/history?grade=bgs10  — only a point-in-time value
+  //      exists (cards.pc_price_bgs10); response is a single row with
+  //      `pointInTime: true` so the UI renders a dashed reference line
+  //      rather than a series.
+  app.get('/api/cards/:id/history', optionalAuth, (req, res) => {
+    const cardId = String(req.params.id)
+    const card = db
+      .prepare(`SELECT id, set_id, pc_price_bgs10 FROM cards WHERE id = ?`)
+      .get(cardId) as { id: string; set_id: string | null; pc_price_bgs10: number | null } | undefined
+    if (!card) return res.status(404).json({ error: 'Not found' })
+
+    if (isFreeUser(req) && card.set_id) {
+      const allowed = getFreeSetIds(db)
+      if (!allowed.includes(card.set_id)) {
+        return res.status(403).json({ error: 'Upgrade to premium to view cards from older sets' })
+      }
+    }
+
+    const grade = (typeof req.query.grade === 'string' ? req.query.grade : 'raw').toLowerCase()
+    const VALID = ['raw', 'grade7', 'grade8', 'grade9', 'grade95', 'psa10', 'bgs10']
+    if (!VALID.includes(grade)) {
+      return res.status(400).json({ error: `invalid grade; use one of ${VALID.join(', ')}` })
+    }
+
+    if (grade === 'bgs10') {
+      if (card.pc_price_bgs10 == null) {
+        return res.json({ grade, pointInTime: true, series: [] })
+      }
+      // Stamp "now" on the point so UIs that plot time-vs-price can render
+      // a horizontal reference line without faking a series.
+      return res.json({
+        grade,
+        pointInTime: true,
+        series: [{ timestamp: new Date().toISOString(), price: card.pc_price_bgs10 }],
+      })
+    }
+
+    if (grade === 'raw') {
+      // Union live TCGPlayer + PC chart + PC grade-history raw series.
+      // Same-day collisions prefer PC (prio=0) over TCGPlayer (prio=1)
+      // because PC's median is volume-smoothed and more stable. The
+      // ROW_NUMBER window function deduplicates per day deterministically;
+      // SQLite 3.25+ supports it and is bundled with better-sqlite3.
+      const rows = db
+        .prepare(
+          `WITH unioned AS (
+             SELECT substr(timestamp, 1, 10) AS ts,
+                    COALESCE(pricecharting_median, tcgplayer_market) AS price,
+                    CASE WHEN pricecharting_median IS NOT NULL THEN 'pricecharting' ELSE 'tcgplayer' END AS source,
+                    CASE WHEN pricecharting_median IS NOT NULL THEN 0 ELSE 1 END AS prio
+             FROM price_history
+             WHERE card_id = ?
+               AND COALESCE(pricecharting_median, tcgplayer_market) IS NOT NULL
+               AND COALESCE(pricecharting_median, tcgplayer_market) > 0
+             UNION ALL
+             SELECT substr(ts, 1, 10) AS ts, price, 'pricecharting-grade' AS source, 0 AS prio
+             FROM card_grade_history
+             WHERE card_id = ? AND grade = 'raw' AND price > 0
+           ),
+           ranked AS (
+             SELECT ts, price, source,
+                    ROW_NUMBER() OVER (PARTITION BY ts ORDER BY prio) AS rn
+             FROM unioned
+           )
+           SELECT ts AS timestamp, price, source
+           FROM ranked
+           WHERE rn = 1
+           ORDER BY ts ASC`,
+        )
+        .all(cardId, cardId)
+      return res.json({ grade, pointInTime: false, series: rows })
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT ts AS timestamp, price, source FROM card_grade_history
+         WHERE card_id = ? AND grade = ? AND price > 0
+         ORDER BY ts ASC`,
+      )
+      .all(cardId, grade)
+    res.json({ grade, pointInTime: false, series: rows })
+  })
+
   app.get('/api/cards/:id/investment', authenticate, requireRole('premium', 'admin'), (req, res) => {
     const row = db
       .prepare(
@@ -671,6 +762,22 @@ export function createApp(db: Database) {
       const result = await refreshSealedPrices(db)
       const { refreshSetMetrics } = await import('./services/setMetrics.js')
       refreshSetMetrics(db)
+      cacheInvalidateAll()
+      res.json({ ok: true, ...result })
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) })
+    }
+  })
+
+  // Admin-triggered price-history scrub. Uses the multi-signal algorithm in
+  // priceHistoryScrub.ts. Safe to re-run (winsorized rows are marked and
+  // skipped); `cardId` query param narrows to a single card for debugging.
+  app.post('/api/internal/scrub-price-history', authenticate, requireAdmin, async (req, res) => {
+    try {
+      const { scrubPriceHistory } = await import('./services/priceHistoryScrub.js')
+      const cardId = typeof req.query.cardId === 'string' ? req.query.cardId : undefined
+      const verbose = req.query.verbose === '1' || req.query.verbose === 'true'
+      const result = scrubPriceHistory(db, { cardId, verbose })
       cacheInvalidateAll()
       res.json({ ok: true, ...result })
     } catch (e) {

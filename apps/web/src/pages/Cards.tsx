@@ -176,6 +176,42 @@ type Hist = { timestamp: string; tcgplayer_market: number | null }
 type TrendWindow = TrendWindowType
 type BrushRange = { startIndex: number; endIndex: number }
 
+/**
+ * The chart-level grade toggle is intentionally a subset of
+ * `GRADE_OPTIONS` (defined at the bottom of this file for the ROI panel)
+ * because we only have historical *series* for raw + PSA 9 / 9.5 / 10 and a
+ * point-in-time reference for BGS 10. Grade 7 / 8 exist as point-in-time
+ * values but aren't commonly plotted by collectors.
+ *
+ * Keys here match the server's `/api/cards/:id/history?grade=` values. Keep
+ * in sync with `apps/server/src/app.ts` and the `card_grade_history.grade`
+ * column.
+ */
+type ChartGradeKey = 'raw' | 'grade9' | 'grade95' | 'psa10' | 'bgs10'
+
+const CHART_GRADE_OPTIONS: { key: ChartGradeKey; label: string; long: string }[] = [
+  { key: 'raw',     label: 'Raw',     long: 'Raw (ungraded)' },
+  { key: 'grade9',  label: 'PSA 9',   long: 'PSA 9' },
+  { key: 'grade95', label: 'PSA 9.5', long: 'PSA 9.5' },
+  { key: 'psa10',   label: 'PSA 10',  long: 'PSA 10' },
+  { key: 'bgs10',   label: 'BGS 10',  long: 'BGS 10 (point-in-time)' },
+]
+
+/**
+ * Per-card point-in-time value for a chart grade, used to grey out grade
+ * buttons that have no PriceCharting data yet and to render the "current
+ * graded prices" summary strip above the chart.
+ */
+function pcPointValueForChartGrade(card: CardRow, key: ChartGradeKey): number | null {
+  switch (key) {
+    case 'raw':     return card.pc_price_raw ?? card.market_price ?? null
+    case 'grade9':  return card.pc_price_grade9 ?? null
+    case 'grade95': return card.pc_price_grade95 ?? null
+    case 'psa10':   return card.pc_price_psa10 ?? null
+    case 'bgs10':   return card.pc_price_bgs10 ?? null
+  }
+}
+
 type SortKey =
   | 'market_price'
   | 'predicted_price'
@@ -262,6 +298,8 @@ export function Cards() {
   const [brushRange, setBrushRange] = useState<BrushRange | null>(null)
   const [insight, setInsight] = useState<CardInvestmentInsight | null>(null)
   const [buyLinks, setBuyLinks] = useState<{ tcgplayer: string; ebay: string; whatnot: string } | null>(null)
+  const [selectedGrade, setSelectedGrade] = useState<ChartGradeKey>('raw')
+  const [gradeMeta, setGradeMeta] = useState<{ pointInTime: boolean } | null>(null)
 
   useEffect(() => {
     setCondition(loadStoredCondition())
@@ -378,13 +416,33 @@ export function Cards() {
     saveShowAdjusted(v)
   }
 
+  /**
+   * Fetch history for the active grade from `/api/cards/:id/history?grade=...`
+   * and marshal into the `Hist` shape the chart already consumes. For BGS 10
+   * (point-in-time only) we still return one row so the stats panel renders,
+   * but tag `gradeMeta.pointInTime` so the chart can render it as a reference
+   * line rather than a misleading flat series.
+   */
+  const fetchGradeHistory = async (cardId: string, grade: ChartGradeKey) => {
+    try {
+      const r = await api<{ grade: string; pointInTime: boolean; series: { timestamp: string; price: number }[] }>(
+        `/api/cards/${cardId}/history?grade=${grade}`,
+      )
+      setGradeMeta({ pointInTime: !!r.pointInTime })
+      setHist(r.series.map((p) => ({ timestamp: p.timestamp, tcgplayer_market: p.price })))
+    } catch {
+      setGradeMeta(null)
+      setHist([])
+    }
+  }
+
   const openDetail = async (c: CardRow) => {
     setSel(c)
     setOpen(true)
     setInsight(null)
     setBrushRange(null)
-    const d = await api<{ card: CardRow; priceHistory: Hist[] }>(`/api/cards/${c.id}`)
-    setHist(d.priceHistory)
+    setSelectedGrade('raw')
+    await fetchGradeHistory(c.id, 'raw')
     try {
       const i = await api<CardInvestmentInsight>(`/api/cards/${c.id}/investment`)
       setInsight(i)
@@ -400,6 +458,13 @@ export function Cards() {
       setBuyLinks(null)
     }
   }
+
+  // Refetch when the user toggles grade on an already-open card.
+  useEffect(() => {
+    if (!sel || !open) return
+    void fetchGradeHistory(sel.id, selectedGrade)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedGrade, sel?.id])
 
   const fullHistory = useMemo(() => buildFullHistory(hist), [hist])
 
@@ -1002,32 +1067,99 @@ export function Cards() {
             {sel?.explain_json && <ModelExplainPanel json={sel.explain_json} />}
             {insight && <InvestmentInsightPanel insight={insight} />}
           </div>
-          {chartData.length > 1 && (
+          {(chartData.length > 1 || gradeMeta?.pointInTime) && (
             <div className="mt-4 rounded-lg border border-border/70 bg-muted/15 p-3">
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs font-medium text-foreground">Price history</p>
-                <div className="flex flex-wrap gap-1">
-                  {(
-                    [
-                      ['1m', '1M'],
-                      ['3m', '3M'],
-                      ['6m', '6M'],
-                      ['1y', '1Y'],
-                      ['all', 'ALL'],
-                    ] as const
-                  ).map(([k, label]) => (
-                    <Button
-                      key={k}
-                      type="button"
-                      size="xs"
-                      variant={trendWindow === k ? 'secondary' : 'outline'}
-                      onClick={() => setTrendWindow(k)}
+              <div className="mb-2 flex flex-col gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-xs font-medium text-foreground">
+                      Price history — {CHART_GRADE_OPTIONS.find((g) => g.key === selectedGrade)?.long ?? 'Raw'}
+                    </p>
+                    <span
+                      className="cursor-help text-[0.65rem] text-muted-foreground"
+                      title={
+                        'Raw = ungraded market. Sources: TCGPlayer (live, outlier-gated) + PriceCharting ' +
+                        '"loose" series. PSA 9 / 9.5 / 10 come from PriceCharting graded charts. BGS 10 is ' +
+                        'a point-in-time reference only (no historical series available).'
+                      }
                     >
-                      {label}
-                    </Button>
-                  ))}
+                      ⓘ
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {(
+                      [
+                        ['1m', '1M'],
+                        ['3m', '3M'],
+                        ['6m', '6M'],
+                        ['1y', '1Y'],
+                        ['all', 'ALL'],
+                      ] as const
+                    ).map(([k, label]) => (
+                      <Button
+                        key={k}
+                        type="button"
+                        size="xs"
+                        variant={trendWindow === k ? 'secondary' : 'outline'}
+                        onClick={() => setTrendWindow(k)}
+                        disabled={gradeMeta?.pointInTime}
+                      >
+                        {label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[0.65rem] uppercase tracking-wider text-muted-foreground">Grade</span>
+                  <div className="flex flex-wrap gap-1">
+                    {CHART_GRADE_OPTIONS.map((g) => {
+                      const pointValue = sel ? pcPointValueForChartGrade(sel, g.key) : null
+                      const hasData =
+                        g.key === 'raw' ||
+                        g.key === 'bgs10' ||
+                        (pointValue != null && pointValue > 0)
+                      return (
+                        <Button
+                          key={g.key}
+                          type="button"
+                          size="xs"
+                          variant={selectedGrade === g.key ? 'secondary' : 'outline'}
+                          onClick={() => setSelectedGrade(g.key)}
+                          disabled={!hasData}
+                          title={hasData ? undefined : 'No PriceCharting data yet for this grade'}
+                          aria-label={`Show ${g.long} history`}
+                        >
+                          {g.label}
+                        </Button>
+                      )
+                    })}
+                  </div>
                 </div>
               </div>
+
+              {sel && CHART_GRADE_OPTIONS.some((g) => {
+                const v = pcPointValueForChartGrade(sel, g.key)
+                return g.key !== 'raw' && v != null && v > 0
+              }) && (
+                <div className="mb-2 rounded-md border border-border/70 bg-background/70 px-2 py-1.5">
+                  <p className="mb-1 text-[0.65rem] uppercase tracking-wider text-muted-foreground">
+                    Current graded prices (PriceCharting)
+                  </p>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[0.7rem] sm:grid-cols-5">
+                    {CHART_GRADE_OPTIONS.map((g) => {
+                      const v = pcPointValueForChartGrade(sel, g.key)
+                      return (
+                        <div key={g.key} className="flex items-baseline justify-between gap-1">
+                          <span className="text-muted-foreground">{g.label}</span>
+                          <span className="tabular-nums font-medium">
+                            {v != null && v > 0 ? `$${v.toFixed(2)}` : '—'}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
 
               {chartStats && (
                 <div className="mb-2 grid grid-cols-2 gap-2 text-[0.7rem] sm:grid-cols-4">

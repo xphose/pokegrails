@@ -37,6 +37,24 @@ export function runMigrations(db: Database.Database) {
   safeAdd('cards', 'pc_price_psa10', 'REAL')
   safeAdd('cards', 'pc_price_bgs10', 'REAL')
 
+  // Tag individual history rows so we can distinguish live TCGPlayer ticks
+  // from winsorized / scrubbed values. NULL is treated as "legacy/untagged".
+  safeAdd('price_history', 'source', 'TEXT')
+
+  // Per-grade historical series from PriceCharting's VGPC.chart_data blob.
+  // `price_history` only stores ungraded (tcgplayer_market / pricecharting_median);
+  // graded-price charts live here because they're a completely different signal
+  // and the cardinality explodes otherwise (N cards × ~6 grades × ~500 days).
+  db.exec(`CREATE TABLE IF NOT EXISTS card_grade_history (
+    card_id TEXT NOT NULL,
+    grade   TEXT NOT NULL,
+    ts      TEXT NOT NULL,
+    price   REAL NOT NULL,
+    source  TEXT NOT NULL DEFAULT 'pricecharting-chart',
+    PRIMARY KEY (card_id, grade, ts)
+  )`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cgh_card_grade_ts ON card_grade_history (card_id, grade, ts)`)
+
   db.exec(`CREATE TABLE IF NOT EXISTS sealed_products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     set_id TEXT NOT NULL,

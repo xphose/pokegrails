@@ -59,27 +59,175 @@ export interface TcgPriceEnvelope {
   mid: number | null
   high: number | null
   updatedAt: string | null
+  /** Which TCGPlayer variant ("holofoil", "normal", etc.) these numbers came from. */
+  variant: string | null
 }
 
 const TCGPLAYER_CAP = 99_999
 
+/**
+ * TCGPlayer price-envelope variants in priority order. Previously the code
+ * iterated `Object.keys(prices)` and picked the first defined value with `??=`,
+ * which is non-deterministic: for a card with both `holofoil` and
+ * `reverseHolofoil` prices, whichever happened to hash first "won", and that
+ * could silently flip between ingests.
+ *
+ * The ordering here follows actual Pokémon TCG collector convention:
+ *   - `holofoil` is the canonical modern printing for every rare and above
+ *   - `normal` covers commons/uncommons with no foil variant
+ *   - `reverseHolofoil` is a distinct print, intentionally ranked *after*
+ *     the canonical print so we don't accidentally quote reverse holo prices
+ *     for the main card
+ *   - 1st Edition variants next (vintage)
+ *   - unlimited variants last (legacy / low-signal)
+ */
+const TCG_VARIANT_PRIORITY = [
+  'holofoil',
+  'normal',
+  'reverseHolofoil',
+  '1stEditionHolofoil',
+  '1stEditionNormal',
+  'unlimitedHolofoil',
+  'unlimited',
+] as const
+
 function tcgplayerPrices(card: Record<string, unknown>): TcgPriceEnvelope {
-  const env: TcgPriceEnvelope = { market: null, low: null, mid: null, high: null, updatedAt: null }
+  const env: TcgPriceEnvelope = { market: null, low: null, mid: null, high: null, updatedAt: null, variant: null }
   const tcg = card.tcgplayer as Record<string, unknown> | undefined
   if (!tcg) return env
   env.updatedAt = typeof tcg.updatedAt === 'string' ? tcg.updatedAt : null
   const prices = tcg.prices as Record<string, Record<string, number>> | undefined
   if (!prices) return env
   const ok = (v: unknown): v is number => typeof v === 'number' && v > 0 && v < TCGPLAYER_CAP
-  for (const k of Object.keys(prices)) {
+
+  // Walk variants in priority order; first one that gives us a usable market OR mid
+  // wins, and we do NOT blend fields across variants.
+  const order = [
+    ...TCG_VARIANT_PRIORITY.filter((k) => k in prices),
+    ...Object.keys(prices).filter((k) => !(TCG_VARIANT_PRIORITY as readonly string[]).includes(k)),
+  ]
+  for (const k of order) {
     const p = prices[k]
     if (!p) continue
-    if (ok(p.market)) env.market ??= p.market
-    if (ok(p.low)) env.low ??= p.low
-    if (ok(p.mid)) env.mid ??= p.mid
-    if (ok(p.high)) env.high ??= p.high
+    const hasUsableSignal = ok(p.market) || ok(p.mid)
+    if (!hasUsableSignal) continue
+    env.variant = k
+    env.market = ok(p.market) ? p.market : null
+    env.low = ok(p.low) ? p.low : null
+    env.mid = ok(p.mid) ? p.mid : null
+    env.high = ok(p.high) ? p.high : null
+    break
   }
   return env
+}
+
+export interface GateResult {
+  /** Price we should persist (or null to drop this tick entirely). */
+  market: number | null
+  /** Which gate, if any, modified the raw value. Useful for logging/tests. */
+  reason: 'pass' | 'high_vs_mid' | 'spike_vs_prior' | 'mad_outlier' | 'winsorized' | 'null_input'
+}
+
+/**
+ * Rolling-window stats used by the MAD gate. Caller provides the 14-day
+ * envelope from price_history; we re-compute here because the table schema
+ * isn't imported into this module.
+ */
+export interface RecentPriceStats {
+  median: number
+  /** Median Absolute Deviation — robust scale estimator. */
+  mad: number
+  /** How many samples informed these stats. */
+  count: number
+}
+
+/**
+ * Data-scientist outlier gate for TCGPlayer's `market` field.
+ *
+ * TCGPlayer's `market` is a volume-weighted average of recent sales. For
+ * thin-volume cards it can be dragged far from reality by one outlier sale
+ * (whale listing, mispriced auction, etc.). Persisting those values into
+ * `price_history` contaminates charts and every downstream analytic.
+ *
+ * Three independent checks, in order:
+ *   1. `market > 3 × mid` → TCGPlayer's own envelope disagrees with itself;
+ *      fall back to `mid` which is a listing midpoint and is much harder to
+ *      move with a single sale.
+ *   2. `market > 5 × oldPrice` → card appears to have moved >5x since last
+ *      ingest. Real Pokémon singles don't do that in a day without headline
+ *      news; drop the tick and keep the old price. The next ingest will
+ *      confirm or deny.
+ *   3. MAD gate on a 14-day rolling median: if we have at least 3 data
+ *      points, reject any value more than 5 MADs from the median. This is
+ *      the standard robust-statistics outlier rule and is resistant to the
+ *      fat-tail noise in card pricing (a z-score rule would be too tight on
+ *      low-volume cards).
+ *
+ * Between 3x and 5x prior we winsorize rather than drop, capping at
+ * `3 × oldPrice`. That way a legitimate fast mover isn't suppressed.
+ */
+export function gateMarketPrice(
+  env: TcgPriceEnvelope,
+  oldPrice: number | null,
+  recent: RecentPriceStats | null,
+): GateResult {
+  let candidate = env.market ?? env.mid ?? null
+  if (candidate == null) return { market: null, reason: 'null_input' }
+
+  // Gate 1: TCGPlayer's own envelope disagrees.
+  if (env.market != null && env.mid != null && env.mid > 0 && env.market > 3 * env.mid) {
+    candidate = env.mid
+    // Even after falling back to mid, the other gates still run so a clearly
+    // bogus `mid` doesn't sneak through (e.g. if PokemonTCG.io ever publishes
+    // both fields broken).
+  }
+
+  // Gate 2: Spike vs prior ingest.
+  if (oldPrice != null && oldPrice > 10) {
+    if (candidate > 5 * oldPrice) {
+      return { market: oldPrice, reason: 'spike_vs_prior' }
+    }
+    if (candidate > 3 * oldPrice) {
+      // Winsorize: cap at 3x prior rather than drop. Preserves directional
+      // signal for real movers.
+      return { market: 3 * oldPrice, reason: 'winsorized' }
+    }
+  }
+
+  // Gate 3: MAD vs 14-day rolling median.
+  if (recent != null && recent.count >= 3 && recent.median > 0) {
+    const scale = Math.max(recent.mad, 0.05 * recent.median)
+    if (Math.abs(candidate - recent.median) > 5 * scale) {
+      return { market: oldPrice ?? recent.median, reason: 'mad_outlier' }
+    }
+  }
+
+  return { market: candidate, reason: candidate === (env.market ?? env.mid) ? 'pass' : 'high_vs_mid' }
+}
+
+/**
+ * Compute median + MAD over the trailing N days of `price_history` for a card.
+ * Returns null when there isn't enough data to form a robust estimate.
+ */
+export function recentMedianAndMad(
+  db: Database.Database,
+  cardId: string,
+  windowDays = 14,
+): RecentPriceStats | null {
+  const cutoff = new Date(Date.now() - windowDays * 86_400_000).toISOString()
+  const rows = db
+    .prepare(
+      `SELECT tcgplayer_market FROM price_history
+       WHERE card_id = ? AND timestamp >= ?
+         AND tcgplayer_market IS NOT NULL AND tcgplayer_market > 0`,
+    )
+    .all(cardId, cutoff) as { tcgplayer_market: number }[]
+  if (rows.length < 3) return null
+  const sorted = rows.map((r) => r.tcgplayer_market).sort((a, b) => a - b)
+  const median = sorted[Math.floor(sorted.length / 2)]
+  const deviations = sorted.map((v) => Math.abs(v - median)).sort((a, b) => a - b)
+  const mad = deviations[Math.floor(deviations.length / 2)]
+  return { median, mad, count: rows.length }
 }
 
 function tcgplayerMarket(card: Record<string, unknown>): number | null {
@@ -223,6 +371,13 @@ export function upsertCardsFromApi(db: Database.Database, setId: string, cards: 
        ebay_median = excluded.ebay_median`,
   )
 
+  // Tally of how each gate fired during this ingest pass. Surfaced in the
+  // console summary so we can watch for regressions (e.g. sudden surge of
+  // `mad_outlier` rejections may indicate PokemonTCG.io pushed a bad batch).
+  const gateStats: Record<GateResult['reason'], number> = {
+    pass: 0, high_vs_mid: 0, spike_vs_prior: 0, mad_outlier: 0, winsorized: 0, null_input: 0,
+  }
+
   const tx = db.transaction((rows: Record<string, unknown>[]) => {
     for (const c of rows) {
       const id = String(c.id)
@@ -235,7 +390,15 @@ export function upsertCardsFromApi(db: Database.Database, setId: string, cards: 
       const oldRow = oldPriceStmt.get(id) as { market_price: number | null; pricecharting_median: number | null } | undefined
       const oldPrice = oldRow?.market_price ?? null
       const pcMedian = oldRow?.pricecharting_median ?? null
-      const tcgMarket = env.market ?? env.mid ?? null
+
+      // Outlier-gate the TCGPlayer `market` BEFORE it touches cards.market_price
+      // or price_history. Previously a single bad tick from TCGPlayer (e.g. when
+      // a whale listing briefly dominated daily sales volume) was persisted
+      // verbatim and then smeared across the chart forever.
+      const recent = recentMedianAndMad(db, id, 14)
+      const gated = gateMarketPrice(env, oldPrice, recent)
+      gateStats[gated.reason]++
+      const tcgMarket = gated.market
       const market = (pcMedian && pcMedian > 0 ? pcMedian : null) ?? tcgMarket ?? cmEur ?? null
 
       cardStmt.run({
@@ -270,6 +433,17 @@ export function upsertCardsFromApi(db: Database.Database, setId: string, cards: 
     }
   })
   tx(cards)
+
+  const totalRejections = gateStats.spike_vs_prior + gateStats.mad_outlier
+  const totalWinsorized = gateStats.winsorized + gateStats.high_vs_mid
+  if (totalRejections + totalWinsorized > 0) {
+    console.log(
+      `[ingest] set=${setId} gates → pass=${gateStats.pass} winsorized=${totalWinsorized} ` +
+        `(high_vs_mid=${gateStats.high_vs_mid}, winsor=${gateStats.winsorized}) ` +
+        `rejected=${totalRejections} (spike=${gateStats.spike_vs_prior}, mad=${gateStats.mad_outlier}) ` +
+        `null=${gateStats.null_input}`,
+    )
+  }
 }
 
 /**
