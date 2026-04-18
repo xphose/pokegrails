@@ -21,6 +21,22 @@ function hashRefreshToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex')
 }
 
+type LoginFailureReason = 'no-user' | 'bad-password' | 'exception'
+
+/**
+ * Structured log line for every failed login. Never writes the actual
+ * login string (could be a private email) or the password — only a
+ * short SHA-256 prefix so the same account's failed attempts are
+ * correlatable across log lines without exposing the identifier.
+ */
+function logLoginFailure(req: Request, loginKey: string, reason: LoginFailureReason): void {
+  const loginHash = crypto.createHash('sha256').update(loginKey).digest('hex').slice(0, 10)
+  const ip = req.ip ?? 'unknown'
+  console.warn(
+    `[auth] login failed reason=${reason} login_hash=${loginHash} ip=${ip} ua="${(req.headers['user-agent'] || '').slice(0, 80)}"`,
+  )
+}
+
 export function authRoutes(db: Database): Router {
   const router = Router()
 
@@ -83,23 +99,37 @@ export function authRoutes(db: Database): Router {
 
   router.post('/login', async (req: Request, res: Response) => {
     try {
-      const { login, password } = req.body as { login?: string; password?: string }
-      if (!login || !password) {
+      const { login: loginRaw, password } = req.body as { login?: string; password?: string }
+      if (!loginRaw || !password) {
         res.status(400).json({ error: 'login and password are required' })
         return
       }
 
+      // Trim whitespace — autofill and paste commonly introduce a trailing
+      // space or newline. Without this, `"admin @x.com "` misses the row
+      // lookup and surfaces as "Invalid credentials", which is the single
+      // biggest source of "intermittent login failures" in user reports.
+      const loginKey = String(loginRaw).trim().toLowerCase()
+      if (!loginKey) {
+        res.status(400).json({ error: 'login and password are required' })
+        return
+      }
+
+      // username + email are COLLATE NOCASE, so case is already handled by
+      // the column; the explicit toLowerCase above is defense in depth.
       const user = db.prepare(
         'SELECT id, username, email, password_hash, role FROM users WHERE username = ? OR email = ?'
-      ).get(login.toLowerCase(), login.toLowerCase()) as { id: number; username: string; email: string; password_hash: string; role: string } | undefined
+      ).get(loginKey, loginKey) as { id: number; username: string; email: string; password_hash: string; role: string } | undefined
 
       if (!user) {
+        logLoginFailure(req, loginKey, 'no-user')
         res.status(401).json({ error: 'Invalid credentials' })
         return
       }
 
       const valid = await bcrypt.compare(password, user.password_hash)
       if (!valid) {
+        logLoginFailure(req, loginKey, 'bad-password')
         res.status(401).json({ error: 'Invalid credentials' })
         return
       }

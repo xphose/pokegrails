@@ -117,6 +117,40 @@ describe('optionalAuth returns 401 for invalid/expired tokens', () => {
     expect(r.status).toBe(401)
   })
 
+  it('regression: admin with valid token sees ALL Mew ex prints across old and new sets', async () => {
+    // Mirrors the production shape: 3 iconic Mew ex prints live in sets
+    // that are NOT in the free-tier window. If the admin request path
+    // ever regressed to applying the free-set filter, this test fails
+    // immediately. (Observed prod behaviour before the fix: searching
+    // "mew" returned 2 rows because api() had silently retried
+    // anonymously — this guards the SERVER side of that contract.)
+    const db = openMemoryDb()
+    cacheInvalidateAll()
+    db.prepare(
+      `INSERT INTO sets (id, name, release_date, total_cards, last_updated)
+       VALUES ('sv-new-1', 'Newest',   '2026-03-01', 1, datetime('now')),
+              ('sv-new-2', 'Newer',    '2026-02-01', 1, datetime('now')),
+              ('sv-new-3', 'New',      '2026-01-01', 1, datetime('now')),
+              ('sv3pt5',   '151',      '2023-09-22', 207, datetime('now')),
+              ('svp',      'SVP',      '2023-10-01', 200, datetime('now')),
+              ('sv4pt5',   'Paldean Fates', '2024-01-26', 244, datetime('now'))`,
+    ).run()
+    db.prepare(
+      `INSERT INTO cards (id, name, set_id, rarity, market_price, last_updated)
+       VALUES ('sv3pt5-205', 'Mew ex', 'sv3pt5', 'Hyper Rare', 30, datetime('now')),
+              ('svp-053',    'Mew ex', 'svp',    'Promo',      82, datetime('now')),
+              ('sv4pt5-232', 'Mew ex', 'sv4pt5', 'Special Illustration Rare', 820, datetime('now'))`,
+    ).run()
+
+    const r = await request(createApp(db))
+      .get('/api/cards?q=mew')
+      .set('Authorization', `Bearer ${adminToken()}`)
+    expect(r.status).toBe(200)
+    const ids = r.body.items.map((c: any) => c.id).sort()
+    expect(ids).toEqual(['sv3pt5-205', 'sv4pt5-232', 'svp-053'])
+    expect(r.body.tier_limited).toBeFalsy()
+  })
+
   it('regression: search "mew" returns SAME count whether token is fresh or expired — expired must 401', async () => {
     const db = openMemoryDb()
     cacheInvalidateAll()

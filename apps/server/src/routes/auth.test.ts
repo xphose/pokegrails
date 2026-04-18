@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
+import bcrypt from 'bcryptjs'
 import request from 'supertest'
 import { createApp } from '../app.js'
 import { cacheInvalidateAll } from '../cache.js'
@@ -239,4 +240,142 @@ describe('POST /api/auth/google — role assignment', () => {
     const stored = db.prepare('SELECT role FROM users WHERE email = ?').get('owner@example.com') as { role: string }
     expect(stored.role).toBe('free')
   })
+})
+
+/**
+ * POST /api/auth/login hardening.
+ *
+ * The production bug this guards against: users report "sometimes my
+ * credentials are accepted, sometimes they aren't". We traced two
+ * plausible causes that both manifest as a 401 "Invalid credentials"
+ * response:
+ *   1. The login identifier had whitespace (autofill, paste) so the
+ *      users-table lookup missed.
+ *   2. The authLimiter was counting successful logins against the
+ *      same bucket as failed ones, so a user who signs in on many
+ *      tabs / devices could burn through the quota and see 429s —
+ *      which the UI used to render identically to invalid credentials.
+ *
+ * These tests enforce the fixes directly.
+ */
+function seedUser(db: ReturnType<typeof openMemoryDb>, username: string, email: string, password: string, role = 'free') {
+  const hash = bcrypt.hashSync(password, 4) // tiny cost for speed in tests
+  db.prepare(
+    'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
+  ).run(username, email, hash, role)
+}
+
+describe('POST /api/auth/login — whitespace tolerance', () => {
+  beforeEach(() => cacheInvalidateAll())
+
+  it('accepts a login with surrounding whitespace', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ login: '  admin@example.com  ', password: 'correct-horse-battery' })
+
+    expect(res.status).toBe(200)
+    expect(res.body.user.role).toBe('admin')
+    expect(res.body.accessToken).toBeTruthy()
+  })
+
+  it('accepts whitespace around the username form of the login', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ login: '\tadmin\n', password: 'correct-horse-battery' })
+
+    expect(res.status).toBe(200)
+    expect(res.body.user.username).toBe('admin')
+  })
+
+  it('does NOT trim the password', async () => {
+    // Spaces are legitimate password characters. If a user set
+    // "my password " intentionally, we must preserve it; if we trimmed
+    // on their behalf, they'd get locked out of a password they set.
+    const db = openMemoryDb()
+    seedUser(db, 'alice', 'alice@example.com', 'pw-with-trailing ', 'free')
+    const app = createApp(db)
+
+    const good = await request(app)
+      .post('/api/auth/login')
+      .send({ login: 'alice', password: 'pw-with-trailing ' })
+    expect(good.status).toBe(200)
+
+    const bad = await request(app)
+      .post('/api/auth/login')
+      .send({ login: 'alice', password: 'pw-with-trailing' })
+    expect(bad.status).toBe(401)
+  })
+
+  it('empty login after trimming returns 400, not 401', async () => {
+    const db = openMemoryDb()
+    const app = createApp(db)
+    const res = await request(app).post('/api/auth/login').send({ login: '   ', password: 'x' })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('POST /api/auth/login — rate limiting', () => {
+  // express-rate-limit uses an in-memory, process-global store keyed by
+  // IP. Inside a single `createApp(db)` instance that's stable; across
+  // `createApp` calls in the same describe block the SAME middleware is
+  // mounted again and shares the same in-memory bucket unless we
+  // explicitly construct a new store. To keep these tests isolated we
+  // create a fresh app per test and rely on the fact that supertest's
+  // ephemeral listener gets a different `req.ip` on each request in
+  // localhost mode ... actually it doesn't — every supertest request
+  // hits ::ffff:127.0.0.1. So we deliberately burn one bucket per test
+  // and assert based on per-test thresholds.
+  beforeEach(() => cacheInvalidateAll())
+
+  it('successful logins do NOT consume the failed-attempt budget (skipSuccessfulRequests)', async () => {
+    // If successful logins counted toward the 60-per-15min bucket, the
+    // 61st successful login would 429. With skipSuccessfulRequests:true
+    // we can make 80 successful logins without tripping the limit.
+    // We use a reasonably-large number to prove the semantic (not 1000
+    // because each bcrypt round is expensive even at cost=4).
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    for (let i = 0; i < 80; i++) {
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ login: 'admin@example.com', password: 'correct-horse-battery' })
+      expect(res.status, `login #${i} unexpectedly ${res.status}`).toBe(200)
+    }
+  }, 30_000)
+
+  it('more than 60 FAILED login attempts in a row trip the limiter with a rate-limit message', async () => {
+    const db = openMemoryDb()
+    seedUser(db, 'admin', 'admin@example.com', 'correct-horse-battery', 'admin')
+    const app = createApp(db)
+
+    const statuses: number[] = []
+    const bodies: unknown[] = []
+    // Fire 70 bad attempts; once the 60-bucket is exhausted we expect
+    // the remaining calls to return 429 with the distinct message.
+    for (let i = 0; i < 70; i++) {
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ login: 'admin@example.com', password: 'wrong' })
+      statuses.push(res.status)
+      bodies.push(res.body)
+    }
+
+    const count429 = statuses.filter((s) => s === 429).length
+    const count401 = statuses.filter((s) => s === 401).length
+    expect(count401).toBeGreaterThanOrEqual(60)
+    expect(count429).toBeGreaterThanOrEqual(1)
+
+    const rateLimitedBody = bodies.find((b) => typeof b === 'object' && b !== null && 'error' in b && String((b as any).error).toLowerCase().includes('too many'))
+    expect(rateLimitedBody, 'expected a 429 with a "Too many" message to distinguish from "Invalid credentials"').toBeTruthy()
+  }, 30_000)
 })

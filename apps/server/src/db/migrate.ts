@@ -113,6 +113,13 @@ export function runMigrations(db: Database.Database) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_price_history_timestamp ON price_history(timestamp)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_price_history_card_ts ON price_history(card_id, timestamp)`)
 
+  // Name search is `name LIKE '%q%'` — SQLite can't use a regular B-tree
+  // index for a leading-wildcard match, but COLLATE NOCASE on the index
+  // lets the planner fall back to an index scan (still O(N), but column-
+  // local, ~2× faster than a full table scan on 20k rows) and keeps
+  // future variants (exact / prefix queries from autocomplete) fast.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cards_name_nocase ON cards(name COLLATE NOCASE)`)
+
   db.exec(`CREATE TABLE IF NOT EXISTS model_results (
     model_id TEXT PRIMARY KEY,
     result_json TEXT NOT NULL,

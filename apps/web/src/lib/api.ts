@@ -1,12 +1,35 @@
-import { getValidAccessToken, refreshAccessToken, clearTokens } from './auth'
+import {
+  getAccessToken,
+  getValidAccessToken,
+  refreshAccessToken,
+  notifySessionExpired,
+  SessionExpiredError,
+} from './auth'
 
 const base = ''
 
+/**
+ * Authenticated data-fetch helper.
+ *
+ * Consistency contract (the whole point of this file):
+ *   - If we started the request with an access token (i.e. the user
+ *     believes they're signed in) and the server rejects it, we try to
+ *     refresh ONCE.
+ *   - If refresh fails, we DO NOT silently re-issue the request as
+ *     anonymous. Previously this was the source of the "search 'mew'
+ *     returns 2 cards then Reload Data fixes it" bug: endpoints like
+ *     /api/cards use `optionalAuth` and happily return the free-tier
+ *     subset to unauthenticated callers.
+ *   - Instead we throw SessionExpiredError and fire notifySessionExpired
+ *     so the AuthProvider can log the user out cleanly and redirect.
+ *
+ * Anonymous callers (no token to begin with) continue to work — they
+ * get whatever the endpoint serves to unauth users, which is the
+ * correct behavior for pre-login public pages.
+ */
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  // getValidAccessToken() proactively refreshes when expiry is <30s away,
-  // so optionalAuth endpoints (like /api/cards) don't silently downgrade
-  // to free-tier results after 15 minutes of idle browsing.
-  let token = await getValidAccessToken()
+  const startedWithToken = !!getAccessToken()
+  const token = await getValidAccessToken()
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...init?.headers as Record<string, string> }
   if (token) headers['Authorization'] = `Bearer ${token}`
 
@@ -17,14 +40,17 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     if (newToken) {
       headers['Authorization'] = `Bearer ${newToken}`
       res = await fetch(`${base}${path}`, { ...init, headers })
-    } else {
-      clearTokens()
+    } else if (startedWithToken) {
+      notifySessionExpired()
+      throw new SessionExpiredError()
     }
   }
 
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
   return res.json() as Promise<T>
 }
+
+export { SessionExpiredError } from './auth'
 
 export type SetMeta = {
   id: string

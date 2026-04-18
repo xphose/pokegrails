@@ -7,20 +7,19 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { queryClient } from '@/lib/query-client'
 import { initThemeMode } from '@/lib/theme'
 import { HelpCenterProvider } from '@/components/help-center'
-import { AuthProvider } from '@/lib/auth'
 
 initThemeMode()
 
+// AuthProvider lives inside App.tsx (inside BrowserRouter) so it can use
+// useNavigate / useLocation for session-expiry redirects.
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <HelpCenterProvider>
-          <TooltipProvider delay={250} closeDelay={400}>
-            <App />
-          </TooltipProvider>
-        </HelpCenterProvider>
-      </AuthProvider>
+      <HelpCenterProvider>
+        <TooltipProvider delay={250} closeDelay={400}>
+          <App />
+        </TooltipProvider>
+      </HelpCenterProvider>
     </QueryClientProvider>
   </StrictMode>,
 )

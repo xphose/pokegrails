@@ -1,6 +1,50 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { useNavigate, useLocation } from 'react-router-dom'
 
 export type UserRole = 'free' | 'premium' | 'admin'
+
+/**
+ * Thrown by api()/authApi() when a request was made on behalf of an
+ * authenticated user but the refresh token could not be renewed. The
+ * AuthProvider installs a module-level handler that clears the session,
+ * invalidates the React Query cache, and navigates the user to /login.
+ *
+ * This exists to kill the "silent free-tier downgrade" class of bug —
+ * previously api() would fall through and retry the original request
+ * without an Authorization header, and endpoints like /api/cards would
+ * happily return the ~3-set free-tier subset. Users saw "2 Mew cards"
+ * and no indication that re-auth was needed.
+ */
+export class SessionExpiredError extends Error {
+  constructor(message = 'Session expired') {
+    super(message)
+    this.name = 'SessionExpiredError'
+  }
+}
+
+type SessionExpiredHandler = () => void
+let sessionExpiredHandler: SessionExpiredHandler | null = null
+
+/**
+ * Called by api()/authApi() when a session-level 401 hits. Deduplicates
+ * rapid back-to-back invocations (lots of in-flight fetches all 401ing
+ * at once) via a trailing-edge debounce so the user only sees one
+ * redirect and React Query is invalidated once.
+ */
+let expiryPending = false
+export function notifySessionExpired(): void {
+  if (expiryPending) return
+  expiryPending = true
+  queueMicrotask(() => {
+    expiryPending = false
+    sessionExpiredHandler?.()
+  })
+}
+
+function setSessionExpiredHandler(fn: SessionExpiredHandler | null): void {
+  sessionExpiredHandler = fn
+}
 
 export interface User {
   id: number
@@ -136,6 +180,9 @@ export async function getValidAccessToken(): Promise<string | null> {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AuthState>({ user: null, loading: true })
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const location = useLocation()
 
   const fetchUser = useCallback(async () => {
     const token = await getValidAccessToken()
@@ -153,6 +200,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => { fetchUser() }, [fetchUser])
+
+  // Install the global session-expiry handler. When any api()/authApi()
+  // call detects that a previously-authenticated request cannot be
+  // refreshed, this fires: clear tokens, blow away the React Query cache
+  // (so no stale "authenticated" data is shown to the now-anonymous
+  // session), reset user state, and bounce to /login with a reason so
+  // the login page can explain what happened instead of the user seeing
+  // a generic error.
+  useEffect(() => {
+    setSessionExpiredHandler(() => {
+      clearTokens()
+      queryClient.clear()
+      setState({ user: null, loading: false })
+      // Preserve the current path so we can return after sign-in. Only
+      // navigate when not already on a public route.
+      const pathname = location.pathname
+      if (pathname !== '/login' && pathname !== '/register') {
+        navigate('/login', {
+          replace: true,
+          state: { from: pathname, reason: 'session-expired' },
+        })
+      }
+    })
+    return () => setSessionExpiredHandler(null)
+  }, [queryClient, navigate, location.pathname])
 
   const login = async (login: string, password: string) => {
     const data = await authApi<{ user: User; accessToken: string; refreshToken: string }>(
@@ -216,7 +288,19 @@ export function useAuth(): AuthContextType {
   return ctx
 }
 
+/**
+ * Internal helper shared by /api/auth/* calls (login, register, me,
+ * refresh, logout). Unlike lib/api.ts's `api()` which is for general
+ * authed data fetching, authApi is also used during sign-in where no
+ * token exists yet — so it tolerates missing tokens for public flows.
+ *
+ * If the caller *was* authenticated (had a token) and the 401-retry
+ * refresh fails, we raise SessionExpiredError so the AuthProvider can
+ * clear the session. The only path that reaches this state is a
+ * corrupted/expired refresh token for an otherwise-logged-in user.
+ */
 async function authApi<T>(path: string, init?: RequestInit): Promise<T> {
+  const startedWithToken = !!getAccessToken()
   let token = await getValidAccessToken()
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (token) headers['Authorization'] = `Bearer ${token}`
@@ -228,6 +312,9 @@ async function authApi<T>(path: string, init?: RequestInit): Promise<T> {
     if (newToken) {
       headers['Authorization'] = `Bearer ${newToken}`
       res = await fetch(path, { ...init, headers: { ...headers, ...init?.headers } })
+    } else if (startedWithToken) {
+      notifySessionExpired()
+      throw new SessionExpiredError()
     }
   }
 

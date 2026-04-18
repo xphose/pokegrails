@@ -7,11 +7,13 @@ import { AnalyticsPage } from './Analytics'
 
 function wrapper({ children }: { children: React.ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  // AuthProvider uses router hooks (useNavigate/useLocation) for
+  // session-expiry redirects, so it must sit inside the router.
   return (
     <QueryClientProvider client={qc}>
-      <AuthProvider>
-        <MemoryRouter>{children}</MemoryRouter>
-      </AuthProvider>
+      <MemoryRouter>
+        <AuthProvider>{children}</AuthProvider>
+      </MemoryRouter>
     </QueryClientProvider>
   )
 }

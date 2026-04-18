@@ -85,16 +85,28 @@ export function createApp(db: Database) {
   })
   app.use('/api', apiLimiter)
 
-  // Login/register have their own limiter so a bot spraying passwords can't
-  // burn through the global budget. 20/15min was ok security-wise but the
-  // same user/IP refreshing the page during a password-manager prompt could
-  // eat 5+ in a second. 40/15min keeps brute-force infeasible while giving
-  // a human plenty of room to mistype a password and retry.
+  // Login/register have their own limiter so a bot spraying passwords
+  // can't burn through the global budget. Two important properties:
+  //
+  //   1. `skipSuccessfulRequests: true` — a legit user signing in from
+  //      multiple tabs / devices / after logout shouldn't burn their
+  //      budget. Only FAILED attempts count. Without this, a user with
+  //      5 tabs open and a session expiry can hit 429 just by everyone
+  //      re-signing in, and the UI surfaces it as "Too many attempts"
+  //      right after a successful password entry — indistinguishable
+  //      from "wrong password" to a non-technical user.
+  //   2. Raised max to 60 per 15 min. Brute-forcing a password at ≤1
+  //      attempt per 15s is not a viable attack, and humans mistype.
+  //
+  // Default keyGenerator is per-IP (via `trust proxy: 1` above reading
+  // Caddy's X-Forwarded-For, confirmed below) — so one abusive IP can't
+  // eat the whole budget for other users.
   const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 40,
+    max: 60,
     standardHeaders: true,
     legacyHeaders: false,
+    skipSuccessfulRequests: true,
     message: { error: 'Too many login attempts — please wait a few minutes.' },
   })
   app.use('/api/auth/login', authLimiter)

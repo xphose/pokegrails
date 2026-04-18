@@ -29,6 +29,7 @@ import {
   type SetMeta,
 } from '@/lib/api'
 import { UpgradeBanner } from '@/components/UpgradeBanner'
+import { useAuth } from '@/lib/auth'
 import { SetMetaTooltipBody, setHoverTitle } from '@/components/set-meta-tooltip'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -261,6 +262,7 @@ const CARDS_PAGE_SIZE = 80
 export function Cards() {
   const location = useLocation()
   const [, setSearchParams] = useSearchParams()
+  const { user, isPremium } = useAuth()
 
   const [qInput, setQInput] = useState(() => getInitialCardsFilters(location.search).q)
   const [qApplied, setQApplied] = useState(() => getInitialCardsFilters(location.search).q)
@@ -383,7 +385,11 @@ export function Cards() {
     initialPageParam: 0,
     getNextPageParam: (last) =>
       last.offset + last.limit < last.total ? last.offset + last.limit : undefined,
-    staleTime: 45_000,
+    // 10s is short enough that an auth-state transition (login, upgrade)
+    // is reflected quickly, long enough to survive normal pagination and
+    // filter-toggling without refetch storms. Previously 45s held stale
+    // free-tier results on screen after a session came back online.
+    staleTime: 10_000,
   })
 
   const rows = useMemo(
@@ -391,6 +397,30 @@ export function Cards() {
     [cardsQuery.data?.pages],
   )
   const totalCount = cardsQuery.data?.pages[0]?.total ?? 0
+  // If the server returned `tier_limited: true` but the client thinks the
+  // user is premium/admin, we have a desync (usually: refresh token was
+  // just rotated, the first request raced the new token). Surface a
+  // banner and a one-shot refetch, instead of silently showing ~3 sets
+  // worth of rows. This is the defense-in-depth layer behind the
+  // SessionExpiredError hard-fail path in lib/api.ts.
+  const tierLimited = cardsQuery.data?.pages[0]?.tier_limited === true
+  // "tier desync" = server served free-tier data but client thinks user
+  // is premium/admin. We only get here if the SessionExpiredError path
+  // in lib/api.ts missed (e.g. the access token was valid at send time
+  // but somehow the server treated the caller as anonymous, or a rare
+  // cache-serving-stale-free-tier race). Force a one-shot refetch.
+  const tierDesync = tierLimited && isPremium
+  const lastDesyncRefetchRef = useRef(0)
+  useEffect(() => {
+    if (!tierDesync) return
+    const now = Date.now()
+    // Throttle the defensive refetch to at most once every 5s so a
+    // persistent desync can't drive a refetch storm.
+    if (now - lastDesyncRefetchRef.current < 5000) return
+    lastDesyncRefetchRef.current = now
+    void cardsQuery.refetch()
+  }, [tierDesync, cardsQuery])
+
   const loading = cardsQuery.isPending
   const error =
     cardsQuery.error instanceof Error ? cardsQuery.error.message : cardsQuery.error ? String(cardsQuery.error) : null
@@ -615,6 +645,19 @@ export function Cards() {
           <HelpButton sectionId="cards-overview" className="mt-[-2px]" />
         </div>
         <UpgradeBanner />
+
+        {tierDesync && user && (
+          <div
+            role="status"
+            className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200"
+          >
+            <span className="font-medium">Reloading full catalog…</span>{' '}
+            <span className="text-amber-200/80">
+              The server briefly served a limited view. We're fetching the complete list for your
+              account. If this keeps happening, sign out and back in.
+            </span>
+          </div>
+        )}
 
         <div className="flex shrink-0 flex-wrap items-end gap-3">
           <div className="flex flex-col gap-1">
