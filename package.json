@@ -10,6 +10,7 @@
     "dev:api": "npm run dev -w server",
     "dev:prod-data": "bash scripts/dev-with-prod-data.sh",
     "snapshot": "bash scripts/pull-prod-snapshot.sh",
+    "local:admin": "bash scripts/create-local-admin.sh",
     "build": "npm run build -w server && npm run build -w web",
     "start": "npm run start -w server",
     "test": "npm run test -w server && npm run test -w web",

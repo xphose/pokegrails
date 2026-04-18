@@ -110,7 +110,28 @@ echo "[snapshot] local size: $(du -h "$SNAPSHOT" | awk '{print $1}')"
 
 if [ "$KEEP_SECRETS" = "0" ]; then
   LOCAL_PW="${POKEGRAILS_LOCAL_PASSWORD:-devdev123}"
-  echo "[snapshot] sanitizing — keeping $ADMIN_EMAIL as admin, wiping other users & all tokens"
+
+  # Safety gate: confirm the admin email actually exists in the prod DB
+  # BEFORE we delete all the other users. Without this check, a typo or
+  # leftover placeholder (e.g. POKEGRAILS_ADMIN_EMAIL=you@example.com)
+  # silently wipes every row and leaves you with User count: 0 and no
+  # way to log in. Happened once — not doing that again.
+  MATCHES=$(sqlite3 "$SNAPSHOT" "SELECT COUNT(*) FROM users WHERE lower(email) = lower('$ADMIN_EMAIL');")
+  if [ "$MATCHES" -eq 0 ]; then
+    echo "[snapshot] ERROR: POKEGRAILS_ADMIN_EMAIL='$ADMIN_EMAIL' does not match any user in the prod snapshot."
+    echo "           Refusing to sanitize — that would delete every user and leave you locked out."
+    echo ""
+    echo "           Fix options (pick one):"
+    echo "             1. Set POKEGRAILS_ADMIN_EMAIL to your real prod email, then re-run."
+    echo "             2. Re-run with --keep-secrets if you want the raw prod DB (not recommended)."
+    echo "             3. Keep this snapshot and run 'npm run local:admin' afterwards to mint a"
+    echo "                fresh local admin (doesn't need to exist in prod)."
+    echo ""
+    echo "           (Snapshot file left at $SNAPSHOT — won't be installed.)"
+    exit 1
+  fi
+
+  echo "[snapshot] sanitizing — keeping $ADMIN_EMAIL ($MATCHES match) as admin, wiping other users & all tokens"
   # Hash the dev password with bcryptjs so it matches auth.ts expectations
   # (auth.ts imports from 'bcryptjs', the pure-JS variant; 'bcrypt' is a
   # different package with a native addon and is NOT a server dep).
@@ -136,7 +157,12 @@ DELETE FROM refresh_tokens;
 COMMIT;
 VACUUM;
 SQL
-  echo "[snapshot] sanitized. User count: $(sqlite3 "$SNAPSHOT" 'SELECT COUNT(*) FROM users;')"
+  FINAL_COUNT=$(sqlite3 "$SNAPSHOT" 'SELECT COUNT(*) FROM users;')
+  if [ "$FINAL_COUNT" -eq 0 ]; then
+    echo "[snapshot] ERROR: sanitize finished with 0 users somehow. Aborting install."
+    exit 1
+  fi
+  echo "[snapshot] sanitized. User count: $FINAL_COUNT"
   echo "[snapshot] dev login → email: $ADMIN_EMAIL   password: $LOCAL_PW"
 fi
 
